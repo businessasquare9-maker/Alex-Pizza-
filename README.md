@@ -1,23 +1,20 @@
-# Alex Pizza — AI Calling Agent
+# Alex Pizza Voice Agent Worker
 
-Production codebase for the Alex Pizza New York inbound voice agent.
+Cloudflare Worker + D1 + Cloudflare Workflows integration for the Alex Pizza Vapi voice agent.
+
+**Current state: staging candidate only.** This build has not been committed to the production branch or deployed. See [Urdu setup and behavior notes](README_UR.md).
+
+## Project files
+- `src/index.js` — Worker module and `OrderProcessingWorkflow` class.
+- `wrangler.toml` — Worker, D1 binding, Workflow binding, and daily maintenance cron.
+- `D1_PREDEPLOY_CHECKS.sql` — read-only checks for the existing D1 database.
+- `verify-build.mjs` — local smoke tests for business hours, menu compatibility, reservation capacity, tool registry, and safety guards.
+
+## Local checks
+```bash
+node --input-type=module --check < src/index.js
+node verify-build.mjs
+```
 
 ## Deployment
-
-Cloudflare Workers Builds should deploy the `main` branch after the production implementation and deployment configuration are committed.
-
-## Runtime
-
-- Cloudflare Workers
-- Cloudflare D1
-- Cloudflare Workflows
-- Vapi inbound voice tools
-- Zoho POS integration
-
-## Tenant
-
-- Tenant ID: `alex-pizza`
-- Business timezone: `America/New_York`
-- Business hours: 12:00 PM–2:00 AM
-
-Production implementation and migrations will be committed together after the integrated code review. Existing D1 menu records must be preserved.
+The Cloudflare Workers Builds deploy command is `npx wrangler deploy`. Keep the Build command empty for this plain JavaScript Worker. Do not deploy until the existing D1 menu, runtime secrets, Workflow binding, and Zoho item mappings have been verified.
