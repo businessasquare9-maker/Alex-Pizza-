@@ -1225,6 +1225,18 @@ async function createBooking(env, tenantId, args) {
         booking_id: bookingId,
         code: clean(err?.code || 'google_calendar_sync_failed', 80)
       });
+      if (env.BOOKING_CALENDAR_WORKFLOW && typeof env.BOOKING_CALENDAR_WORKFLOW.create === 'function') {
+        try {
+          await env.BOOKING_CALENDAR_WORKFLOW.create({
+            id: 'booking-calendar-' + bookingId.toLowerCase(),
+            params: { tenant_id: tenantId, booking_id: bookingId }
+          });
+        } catch (workflowErr) {
+          await recordIntegrationStatus(env, tenantId, 'booking_calendar_workflow', 'start_failed', {
+            booking_id: bookingId, code: clean(workflowErr?.code || 'booking_calendar_workflow_failed', 80)
+          });
+        }
+      }
       try {
         await queueRoleNotification(env, tenantId, 'manager',
           'Reservation needs Google Calendar sync. Booking ID: ' + bookingId + ', requested time: ' + availability.booking_time,
@@ -3484,6 +3496,87 @@ async function handleScheduled(env) {
   } catch (err) {
     safeLog(err);
     return { ok: false, ...publicError(err) };
+  }
+}
+
+export class BookingCalendarWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    const tenantId = validateTenant(event?.payload?.tenant_id);
+    const bookingId = clean(event?.payload?.booking_id || '', 100);
+    if (!bookingId) throw new AppError('Booking Calendar workflow requires booking_id.', 'booking_id_required', 400);
+    await ensureTenantActive(this.env, tenantId);
+
+    const booking = await step.do('load-calendar-booking-' + bookingId, async () => {
+      const columns = await getColumns(this.env, 'bookings');
+      const tenantColumn = findColumn(columns, TENANT_COLUMNS);
+      const idColumn = findColumn(columns, ['id', 'booking_id', 'uuid']);
+      if (!tenantColumn || !idColumn) throw new AppError('Booking schema cannot load Calendar retry row.', 'booking_schema_incomplete', 500);
+      const row = await this.env.DB.prepare(
+        'SELECT * FROM `bookings` WHERE ' + q(tenantColumn) + ' = ? AND ' + q(idColumn) + ' = ? LIMIT 1'
+      ).bind(tenantId, bookingId).first();
+      if (!row) throw new AppError('Booking not found for Calendar workflow.', 'booking_not_found', 404);
+      return {
+        booking_id: bookingId,
+        booking_time: row.booking_time || row.start_time || row.reservation_time,
+        duration_minutes: Number(row.duration_minutes || row.duration || SLOT_DEFAULT_MINUTES),
+        party_size: Number(row.party_size || row.guests || 1),
+        customer_name: row.customer_name || row.name || 'Guest',
+        customer_phone: normalizePhone(row.customer_phone || row.phone || ''),
+        notes: row.notes || row.special_requests || '',
+        status: norm(row.status || '')
+      };
+    });
+
+    if (booking.status === 'confirmed') return { ok: true, booking_id: bookingId, status: 'already_confirmed' };
+    const delays = ['30 seconds', '1 minute', '3 minutes', '10 minutes'];
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      if (attempt > 1) await step.sleep('calendar-sync-delay-' + attempt, delays[attempt - 2]);
+      const result = await step.do('calendar-sync-attempt-' + attempt, {
+        retries: { limit: 2, delay: '5 seconds', backoff: 'exponential' }, timeout: '30 seconds'
+      }, async () => {
+        const calendar = await createGoogleCalendarBooking(this.env, tenantId, booking);
+        if (!calendar?.created) return { created: false, reason: calendar?.reason || 'calendar_not_created' };
+        await updateBookingStatus(this.env, tenantId, bookingId, 'confirmed');
+        await recordIntegrationStatus(this.env, tenantId, 'google_calendar', 'ok', {
+          booking_id: bookingId, event_id: calendar.event_id || null, retry_attempt: attempt
+        });
+        if (booking.customer_phone) {
+          try {
+            await queueNotification(this.env, tenantId, {
+              to: booking.customer_phone, from: resolvePhones(this.env, 'business')[0] || '',
+              message: 'Alex Pizza reservation confirmed for ' + booking.booking_time + '. Reference: ' + bookingId + '.',
+              kind: 'booking_confirmation_after_calendar_retry', channel: 'sms',
+              metadata: { booking_id: bookingId, calendar_retry_attempt: attempt }
+            });
+          } catch (err) {
+            await recordIntegrationStatus(this.env, tenantId, 'booking_notification', 'error', {
+              booking_id: bookingId, code: clean(err?.code || 'booking_notification_failed', 80)
+            });
+          }
+        }
+        try {
+          await queueRoleNotification(this.env, tenantId, 'manager',
+            'Google Calendar reservation sync completed for booking ' + bookingId + '.',
+            'booking_calendar_sync_recovered');
+        } catch {}
+        await audit(this.env, tenantId, 'booking_calendar_sync_recovered', {
+          booking_id: bookingId, event_id: calendar.event_id || null, retry_attempt: attempt
+        });
+        return { created: true, event_id: calendar.event_id || null };
+      });
+      if (result?.created) return { ok: true, booking_id: bookingId, status: 'confirmed', attempts: attempt, ...result };
+    }
+
+    await recordIntegrationStatus(this.env, tenantId, 'google_calendar', 'retry_exhausted', {
+      booking_id: bookingId, attempts: 5
+    });
+    try {
+      await queueRoleNotification(this.env, tenantId, 'manager',
+        'URGENT: Google Calendar sync is still pending after automatic retries for booking ' + bookingId + '. The reservation remains recorded in D1 as pending_calendar_sync.',
+        'booking_calendar_retry_exhausted');
+    } catch {}
+    await audit(this.env, tenantId, 'booking_calendar_sync_retry_exhausted', { booking_id: bookingId, attempts: 5 });
+    return { ok: false, booking_id: bookingId, status: 'pending_calendar_sync', attempts: 5 };
   }
 }
 
