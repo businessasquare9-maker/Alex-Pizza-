@@ -532,7 +532,7 @@ const SCHEMA_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS `manager_status_checks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_reference` TEXT NOT NULL, `customer_phone` TEXT, `caller_hash` TEXT, `manager_phone` TEXT, `inbound_call_id` TEXT, `inbound_control_url` TEXT, `outbound_call_id` TEXT, `status` TEXT, `manager_response` TEXT, `callback_status` TEXT, `callback_sent_at` TEXT, `started_at` TEXT, `completed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `call_usage_ticks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT NOT NULL, `minute_index` INTEGER NOT NULL, `month` TEXT NOT NULL, `counted_at` TEXT NOT NULL, `created_at` TEXT NOT NULL, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `notifications` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `notification_id` TEXT, `recipient_phone` TEXT, `sender_phone` TEXT, `message` TEXT, `notification_type` TEXT, `channel` TEXT, `status` TEXT, `provider_message_id` TEXT, `metadata` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `orders` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `order_type` TEXT, `total` REAL NOT NULL DEFAULT 0, `currency` TEXT, `items_json` TEXT, `status` TEXT, `notes` TEXT, `pos_salesorder_id` TEXT, `pos_confirmed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `orders` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `order_type` TEXT, `total` REAL NOT NULL DEFAULT 0, `currency` TEXT, `items_json` TEXT, `status` TEXT, `notes` TEXT, `pos_salesorder_id` TEXT, `pos_confirmed_at` TEXT, `pos_sync_lock_owner` TEXT, `pos_sync_lock_expires_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `order_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `sku` TEXT, `name` TEXT, `category` TEXT, `unit_price` REAL NOT NULL DEFAULT 0, `quantity` INTEGER NOT NULL DEFAULT 1, `line_total` REAL NOT NULL DEFAULT 0, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `order_change_requests` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `caller_hash` TEXT, `requested_change` TEXT, `reason` TEXT, `status` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `monthly_call_usage` (`tenant_id` TEXT NOT NULL, `month` TEXT NOT NULL, `total_minutes` INTEGER NOT NULL DEFAULT 0, `last_call_at` TEXT, `status` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `month`))',
@@ -572,6 +572,8 @@ async function ensureSchema(env) {
       'ALTER TABLE `orders` ADD COLUMN `related_order_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `delivery_batch_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `scheduled_delivery_at` TEXT',
+      'ALTER TABLE `orders` ADD COLUMN `pos_sync_lock_owner` TEXT',
+      'ALTER TABLE `orders` ADD COLUMN `pos_sync_lock_expires_at` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `pos_salesorder_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `pos_confirmed_at` TEXT',
       'ALTER TABLE `manager_status_checks` ADD COLUMN `inbound_control_url` TEXT',
@@ -2135,6 +2137,26 @@ async function loadOrderForWorkflow(env, tenantId, orderId) {
     status: order.status || 'pending_pos_sync', createdAt: order.created_at || nowIso()
   };
 }
+async function claimOrderPosLock(env, tenantId, orderId, owner, leaseSeconds = 360) {
+  await ensureSchema(env);
+  const now = nowIso();
+  const expires = new Date(Date.now() + Math.max(60, leaseSeconds) * 1000).toISOString();
+  const result = await env.DB.prepare(
+    "UPDATE `orders` SET `pos_sync_lock_owner` = ?, `pos_sync_lock_expires_at` = ?, `updated_at` = ? " +
+    "WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) " +
+    "AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled') " +
+    "AND (`pos_sync_lock_owner` IS NULL OR `pos_sync_lock_owner` = '' OR `pos_sync_lock_expires_at` IS NULL OR datetime(`pos_sync_lock_expires_at`) <= datetime(?) OR `pos_sync_lock_owner` = ?)"
+  ).bind(owner, expires, now, tenantId, orderId, orderId, now, owner).run();
+  return Number(result.meta?.changes || 0) === 1;
+}
+async function releaseOrderPosLock(env, tenantId, orderId, owner) {
+  await ensureSchema(env);
+  await env.DB.prepare(
+    "UPDATE `orders` SET `pos_sync_lock_owner` = NULL, `pos_sync_lock_expires_at` = NULL, `updated_at` = ? " +
+    "WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `pos_sync_lock_owner` = ?"
+  ).bind(nowIso(), tenantId, orderId, orderId, owner).run();
+}
+
 async function updateOrderStatus(env, tenantId, orderId, status) {
   await env.DB.prepare(
     "UPDATE `orders` SET `status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
@@ -2144,48 +2166,102 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
     const tenantId = validateTenant(event?.payload?.tenant_id);
     const orderId = clean(event?.payload?.order_id, 100);
+    const owner = clean(event?.payload?.workflow_owner || event?.instanceId || ('legacy-order-' + orderId), 120);
     await ensureTenantRecord(this.env, tenantId);
     if (!orderId) throw new AppError('Workflow order_id is required.', 'order_id_required', 400);
-    const order = await step.do('load-order-' + orderId, async () =>
-      await loadOrderForWorkflow(this.env, tenantId, orderId)
-    );
-    if (norm(order.status) === 'cancelled' || norm(order.status) === 'canceled') {
-      return { ok: true, order_id: orderId, status: 'cancelled_before_pos_sync', skipped: true };
+
+    let acquired = false;
+    for (let attempt = 1; attempt <= 60; attempt++) {
+      acquired = await step.do('claim-pos-lock-' + attempt, async () =>
+        await claimOrderPosLock(this.env, tenantId, orderId, owner, 360)
+      );
+      if (acquired) break;
+      const current = await step.do('check-pos-lock-order-' + attempt, async () => {
+        const row = await this.env.DB.prepare(
+          'SELECT `status` FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) LIMIT 1'
+        ).bind(tenantId, orderId, orderId).first();
+        return { found: Boolean(row), status: norm(row?.status || '') };
+      });
+      if (!current.found) throw new AppError('Order disappeared before POS sync.', 'order_not_found', 404);
+      if (['cancelled', 'canceled'].includes(current.status)) {
+        return { ok: true, order_id: orderId, status: 'cancelled_before_pos_sync', skipped: true };
+      }
+      await step.sleep('wait-for-pos-lock-' + attempt, '5 seconds');
     }
-    let result;
+    if (!acquired) {
+      await recordIntegrationStatus(this.env, tenantId, 'zoho_pos', 'pos_sync_lock_timeout', { order_id: orderId });
+      try {
+        await queueRoleNotification(this.env, tenantId, 'manager',
+          'Automatic Zoho synchronization is waiting on another update for order ' + orderId + '. The customer-confirmed order remains saved; please monitor the POS sync event.',
+          'zoho_pos_sync_lock_timeout');
+      } catch {}
+      throw new AppError('The order POS update lock could not be acquired within five minutes.', 'pos_sync_lock_timeout', 503);
+    }
+
     try {
-      result = await step.do('push-zoho-' + orderId, {
-        retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
-        timeout: '2 minutes'
-      }, async () => await pushOrderToZoho(this.env, tenantId, order));
-    } catch (err) {
-      await step.do('mark-pos-failed-' + orderId, async () => {
-        await updateOrderStatus(this.env, tenantId, orderId, 'pos_sync_failed');
-        await recordIntegrationStatus(this.env, tenantId, 'zoho_pos', 'error', { order_id: orderId, code: clean(err?.code || 'zoho_push_failed', 80) });
-        try { await queueRoleNotification(this.env, tenantId, 'manager', 'Zoho POS sync failed after automatic retries for order ' + orderId + '. Manual review is required.', 'zoho_pos_sync_error'); } catch {}
-        return { status: 'pos_sync_failed' };
+      // Read the order only after acquiring the lock. A queued edit/addition therefore
+      // always sends the newest D1 bill contents to the same Zoho Sales Order.
+      const order = await step.do('load-order-under-pos-lock', async () =>
+        await loadOrderForWorkflow(this.env, tenantId, orderId)
+      );
+      if (['cancelled', 'canceled'].includes(norm(order.status))) {
+        return { ok: true, order_id: orderId, status: 'cancelled_before_pos_sync', skipped: true };
+      }
+
+      let result;
+      try {
+        result = await step.do('push-zoho-under-pos-lock', {
+          retries: { limit: 3, delay: '10 seconds', backoff: 'exponential' },
+          timeout: '2 minutes'
+        }, async () => await pushOrderToZoho(this.env, tenantId, order));
+      } catch (err) {
+        await step.do('mark-pos-failed-under-pos-lock', async () => {
+          await updateOrderStatus(this.env, tenantId, orderId, 'pos_sync_failed');
+          await recordIntegrationStatus(this.env, tenantId, 'zoho_pos', 'error', {
+            order_id: orderId, code: clean(err?.code || 'zoho_push_failed', 80)
+          });
+          try {
+            await queueRoleNotification(this.env, tenantId, 'manager',
+              'Zoho POS sync failed after automatic retries for order ' + orderId + '. The customer-confirmed D1 order and receipt remain saved; manual POS reconciliation is required.',
+              'zoho_pos_sync_error');
+          } catch {}
+          return { status: 'pos_sync_failed' };
+        });
+        return { ok: false, order_id: orderId, status: 'pos_sync_failed' };
+      }
+
+      if (result?.cancelled) {
+        return { ok: true, order_id: orderId, status: 'cancelled', zoho: result };
+      }
+      if (result?.pushed) {
+        await step.do('mark-pos-confirmed-under-pos-lock', async () => {
+          await updateOrderStatus(this.env, tenantId, orderId, 'pos_confirmed');
+          await audit(this.env, tenantId, 'order_pos_confirmed', {
+            order_id: orderId, salesorder_id: result.salesorder_id || null
+          });
+          return { status: 'pos_confirmed' };
+        });
+        return {
+          ok: true, order_id: orderId, status: 'pos_confirmed', zoho: result,
+          receipt_dispatched_at_order_acceptance: true
+        };
+      }
+      await step.do('mark-pos-pending-under-pos-lock', async () => {
+        await updateOrderStatus(this.env, tenantId, orderId, 'pending_pos_configuration');
+        try {
+          await queueRoleNotification(this.env, tenantId, 'manager',
+            'Order ' + orderId + ' is saved but not confirmed in Zoho POS. Reason: ' + clean(result?.reason || 'not_configured', 120),
+            'zoho_pos_sync_error');
+        } catch {}
+        return { status: 'pending_pos_configuration' };
       });
-      return { ok: false, order_id: orderId, status: 'pos_sync_failed' };
-    }
-    if (result?.cancelled) {
-      return { ok: true, order_id: orderId, status: 'cancelled', zoho: result };
-    }
-    if (result?.pushed) {
-      await step.do('mark-pos-confirmed-' + orderId, async () => {
-        await updateOrderStatus(this.env, tenantId, orderId, 'pos_confirmed');
-        await audit(this.env, tenantId, 'order_pos_confirmed', { order_id: orderId, salesorder_id: result.salesorder_id || null });
-        return { status: 'pos_confirmed' };
+      return { ok: false, order_id: orderId, status: 'pending_pos_configuration', zoho: result };
+    } finally {
+      await step.do('release-pos-lock', async () => {
+        await releaseOrderPosLock(this.env, tenantId, orderId, owner);
+        return { released: true };
       });
-      return { ok: true, order_id: orderId, status: 'pos_confirmed', zoho: result, receipt_dispatched_at_order_acceptance: true };
     }
-    await step.do('mark-pos-pending-' + orderId, async () => {
-      await updateOrderStatus(this.env, tenantId, orderId, 'pending_pos_configuration');
-      await queueRoleNotification(this.env, tenantId, 'manager',
-        'Order ' + orderId + ' is saved but not confirmed in Zoho POS. Reason: ' + clean(result?.reason || 'not_configured', 120),
-        'zoho_pos_sync_error');
-      return { status: 'pending_pos_configuration' };
-    });
-    return { ok: false, order_id: orderId, status: 'pending_pos_configuration', zoho: result };
   }
 }
 
@@ -2379,9 +2455,10 @@ async function submitOrder(env, tenantId, args, ctx) {
   }
   let workflowQueued = true;
   try {
+    const workflowId = 'order-' + order.order_id.toLowerCase();
     await env.ORDER_WORKFLOW.create({
-      id: 'order-' + order.order_id.toLowerCase(),
-      params: { tenant_id: tenantId, order_id: order.order_id }
+      id: workflowId,
+      params: { tenant_id: tenantId, order_id: order.order_id, workflow_owner: workflowId }
     });
   } catch (err) {
     workflowQueued = false;
@@ -2458,7 +2535,7 @@ async function enqueueOrderPosSync(env, tenantId, orderId, changeKind) {
   try {
     await env.ORDER_WORKFLOW.create({
       id: workflowId,
-      params: { tenant_id: tenantId, order_id: orderId }
+      params: { tenant_id: tenantId, order_id: orderId, workflow_owner: workflowId }
     });
     await audit(env, tenantId, 'order_pos_update_workflow_started', {
       order_id: orderId, workflow_id: workflowId, change_kind: changeKind
@@ -3580,7 +3657,7 @@ async function handleAdmin(request, env, url, path) {
     try {
       await env.ORDER_WORKFLOW.create({
         id: workflowId,
-        params: { tenant_id: tenantId, order_id: order.order_id || orderReference }
+        params: { tenant_id: tenantId, order_id: order.order_id || orderReference, workflow_owner: workflowId }
       });
     } catch (err) {
       await updateOrderStatus(env, tenantId, order.order_id || orderReference, 'workflow_start_failed');
