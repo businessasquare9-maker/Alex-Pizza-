@@ -162,7 +162,7 @@ try {
   assert.match(source, /automatic_sku_mapping_attempted/);
   assert.match(source, /price_override_required/);
   assert.match(source, /sku_match_price_override/);
-  assert.match(source, /rate: roundMoney\\(item\\.unit_price \\?\\? item\\.unitPrice\\)/);
+  assert.match(source, /rate: roundMoney\(item\.unit_price \?\? item\.unitPrice\)/);
   assert.match(source, /async function voidZohoSalesOrder/);
   assert.match(source, /method: 'PUT'/);
   assert.match(source, /\/status\/confirmed/);
