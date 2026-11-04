@@ -1100,7 +1100,9 @@ async function checkAvailability(env, tenantId, bookingTime, durationMinutes, re
       tables_needed: tablesNeeded,
       seats_occupied: occupiedSeats + externalCalendarSeats,
       seats_remaining: seatsRemaining,
-      external_calendar_bookings: externalCalendarBookings
+      external_calendar_bookings: externalCalendarBookings,
+      external_calendar_seats: externalCalendarSeats,
+      external_calendar_tables: externalCalendarTables
     };
   }
   const occupied = occupiedTables;
@@ -1110,11 +1112,12 @@ async function checkAvailability(env, tenantId, bookingTime, durationMinutes, re
     duration_minutes: duration,
     tables_occupied: occupied,
     tables_remaining: config.maxTables - occupied,
-    seats_remaining: Math.max(0, 40 - occupiedSeats - externalCalendarBookings * 4 - partySize),
+    seats_remaining: Math.max(0, 40 - occupiedSeats - externalCalendarSeats - partySize),
     tables_needed: tablesNeeded,
     max_tables: config.maxTables,
     external_calendar_bookings: externalCalendarBookings,
     external_calendar_seats: externalCalendarSeats,
+    external_calendar_tables: externalCalendarTables,
     hours: businessHoursMessage(config)
   };
 }
@@ -1196,7 +1199,7 @@ async function createBooking(env, tenantId, args) {
     createdAt: bookingCreatedAt,
     maxTables: businessConfig(env).maxTables,
     externalCalendarSeats: availability.external_calendar_seats,
-    externalCalendarTables: availability.tables_occupied - Math.max(0, availability.tables_occupied - (availability.external_calendar_bookings || 0))
+    externalCalendarTables: availability.external_calendar_tables
   });
   if (!inserted) {
     return { ok: false, code: 'booking_unavailable', available: false, reason: 'Another reservation was confirmed for this time. Please choose another time.' };
@@ -2776,6 +2779,14 @@ async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
       ok: true, order_reference: orderId, current_system_status: orderStatus.status,
       manager_call_status: existing.status, status: 'waiting_for_manager',
       message_for_assistant: 'The manager call is still in progress. Tell the customer you are checking with the manager and ask them to hold. Call request_manager_status_check again with the same order reference and customer phone after a short pause. Do not invent a status and do not transfer the customer.'
+    };
+  }
+  if (existing && ['no_manager_response', 'call_start_failed'].includes(norm(existing.status))) {
+    return {
+      ok: true, order_reference: orderId, current_system_status: orderStatus.status,
+      manager_call_status: existing.status, manager_response: clean(existing.manager_response || '', 1200),
+      status: 'manager_callback_required',
+      message_for_assistant: 'The last manager call ended without a usable status response. Do not repeatedly redial the manager from this same customer enquiry. Tell the customer that the manager could not confirm the status yet, record/retain the manager callback task, and keep the customer with the AI unless they explicitly make a complaint.'
     };
   }
 
