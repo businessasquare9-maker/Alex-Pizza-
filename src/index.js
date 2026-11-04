@@ -1949,14 +1949,28 @@ async function storeZohoSalesOrderId(env, tenantId, orderId, salesOrderId) {
   }
   return id;
 }
+async function voidZohoSalesOrder(env, tenantId, orderId, salesOrderId) {
+  const id = String(salesOrderId || '').trim();
+  if (!/^[0-9]{1,24}$/.test(id)) return { voided: false, skipped: true, reason: 'no_saved_zoho_sales_order_id' };
+  const token = await getZohoAccessToken(env, tenantId);
+  const url = new URL(zohoSalesOrdersUrl(env));
+  url.pathname = url.pathname.replace(/\/+$/, '') + '/' + encodeURIComponent(id) + '/status/void';
+  const response = await fetchWithTimeout(url.toString(), { method: 'POST', headers: { Authorization: 'Zoho-oauthtoken ' + token } }, 10000);
+  let data = {}; try { data = await response.json(); } catch {}
+  const ok = response.ok && Number(data.code) === 0;
+  await recordIntegrationStatus(env, tenantId, 'zoho_pos', ok ? 'sales_order_voided' : 'sales_order_void_failed', {
+    order_id: orderId, salesorder_id: id, provider_status: response.status,
+    provider_code: data.code ?? null, provider_message: clean(data.message || data.error || '', 160)
+  });
+  if (!ok) throw new AppError('Zoho POS could not void the cancelled order: ' + clean(data.message || data.error || ('HTTP ' + response.status), 160),
+    'zoho_order_void_failed', 502, { provider_status: response.status, provider_code: data.code ?? null });
+  return { voided: true, salesorder_id: id };
+}
+
 async function pushOrderToZoho(env, tenantId, order) {
   const orgId = envValue(env, ENV_KEYS.zohoOrganization);
   const customerId = envValue(env, ENV_KEYS.zohoCustomer);
-  const hasZohoCredentials = Boolean(
-    envValue(env, ENV_KEYS.zohoClientId) &&
-    envValue(env, ENV_KEYS.zohoClientSecret) &&
-    envValue(env, ENV_KEYS.zohoRefreshToken)
-  );
+  const hasZohoCredentials = Boolean(envValue(env, ENV_KEYS.zohoClientId) && envValue(env, ENV_KEYS.zohoClientSecret) && envValue(env, ENV_KEYS.zohoRefreshToken));
   if (!hasZohoCredentials || !orgId || !customerId) {
     const missing = [
       !envValue(env, ENV_KEYS.zohoClientId) ? 'ZOHO_CLIENT_ID' : '',
@@ -1965,131 +1979,116 @@ async function pushOrderToZoho(env, tenantId, order) {
       !orgId ? 'ZOHO_ORGANIZATION_ID' : '',
       !customerId ? 'ZOHO_CUSTOMER_ID' : ''
     ].filter(Boolean);
-    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', {
-      order_id: order.order_id, missing
-    });
+    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', { order_id: order.order_id, missing });
     return { pushed: false, reason: 'zoho_pos_configuration_incomplete', missing };
   }
-
   const itemIdMap = await loadZohoItemIdMap(env, tenantId);
   const itemIdFor = sku => itemIdMap[norm(sku)] || itemIdMap[String(sku || '').toUpperCase()] || '';
   const missingSkus = order.items.filter(item => !itemIdFor(item.sku)).map(item => item.sku);
   if (missingSkus.length) {
-    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', {
-      order_id: order.order_id, missing_item_skus: missingSkus
-    });
+    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', { order_id: order.order_id, missing_item_skus: missingSkus });
     return { pushed: false, reason: 'zoho_item_id_mapping_missing', missing_item_skus: missingSkus };
   }
-
+  const customerIdNumber = Number(customerId);
+  const lineItems = order.items.map((item, index) => ({
+    item_id: Number(itemIdFor(item.sku)), name: item.name,
+    rate: roundMoney(item.unit_price ?? item.unitPrice), quantity: item.quantity,
+    unit: 'qty', item_order: index
+  }));
+  if (!Number.isSafeInteger(customerIdNumber) || customerIdNumber <= 0 ||
+      lineItems.some(item => !Number.isSafeInteger(item.item_id) || item.item_id <= 0 || !Number.isFinite(item.rate) || item.rate < 0 || item.quantity < 1)) {
+    throw new AppError('Zoho customer, item ID or price values are invalid.', 'zoho_payload_values_invalid', 503);
+  }
   const token = await getZohoAccessToken(env, tenantId);
   const url = zohoSalesOrdersUrl(env);
   let salesOrderId = await getStoredZohoSalesOrderId(env, tenantId, order.order_id);
   let createdNow = false;
-
+  const statusBefore = await env.DB.prepare('SELECT "status" FROM "orders" WHERE "tenant_id" = ? AND ("order_id" = ? OR "id" = ?) LIMIT 1')
+    .bind(tenantId, order.order_id, order.order_id).first();
+  if (['cancelled', 'canceled'].includes(norm(statusBefore?.status))) {
+    if (salesOrderId) await voidZohoSalesOrder(env, tenantId, order.order_id, salesOrderId);
+    return { pushed: false, cancelled: true, reason: 'order_cancelled_before_zoho_sync' };
+  }
+  const payload = {
+    customer_id: customerIdNumber, salesorder_number: order.order_id,
+    date: localDateForTimeZone(new Date(order.createdAt || Date.now()), TIME_ZONE_DEFAULT),
+    reference_number: order.order_id, is_inclusive_tax: false,
+    notes: [
+      'Created by ' + WORKER_NAME, 'Tenant: ' + tenantId,
+      'Customer bill reference: ' + order.order_id, 'Order type: ' + order.order_type,
+      order.notes ? 'Customer notes: ' + clean(order.notes, 800) : '',
+      order.delivery_address ? 'Delivery address: ' + clean(order.delivery_address, 300) : '',
+      order.related_order_id ? 'Combined delivery with original order: ' + clean(order.related_order_id, 100) : '',
+      order.scheduled_delivery_at ? 'Scheduled delivery: ' + clean(order.scheduled_delivery_at, 80) : ''
+    ].filter(Boolean).join('\n'),
+    line_items: lineItems
+  };
   if (!salesOrderId) {
-    const customerIdNumber = Number(customerId);
-    const lineItems = order.items.map((item, index) => ({
-      item_id: Number(itemIdFor(item.sku)),
-      name: item.name,
-      rate: roundMoney(item.unit_price),
-      quantity: item.quantity,
-      unit: 'qty',
-      item_order: index
-    }));
-    if (!Number.isSafeInteger(customerIdNumber) || customerIdNumber <= 0 ||
-        lineItems.some(item => !Number.isSafeInteger(item.item_id) || item.item_id <= 0 ||
-          !Number.isFinite(item.rate) || item.rate < 0 || item.quantity < 1)) {
-      throw new AppError('Zoho customer, item ID or price values are invalid.', 'zoho_payload_values_invalid', 503);
-    }
-
-    const payload = {
-      customer_id: customerIdNumber,
-      salesorder_number: order.order_id,
-      date: localDateForTimeZone(new Date(order.createdAt || Date.now()), TIME_ZONE_DEFAULT),
-      reference_number: order.order_id,
-      is_inclusive_tax: false,
-      notes: [
-        'Created by ' + WORKER_NAME,
-        'Tenant: ' + tenantId,
-        'Customer bill reference: ' + order.order_id,
-        'Order type: ' + order.order_type,
-        order.notes ? 'Customer notes: ' + clean(order.notes, 800) : '',
-        order.delivery_address ? 'Delivery address: ' + clean(order.delivery_address, 300) : '',
-        order.related_order_id ? 'Combined delivery with original order: ' + clean(order.related_order_id, 100) : '',
-        order.scheduled_delivery_at ? 'Scheduled delivery: ' + clean(order.scheduled_delivery_at, 80) : ''
-      ].filter(Boolean).join('\n'),
-      line_items: lineItems
-    };
-
     const createUrl = new URL(url);
     createUrl.searchParams.set('ignore_auto_number_generation', 'true');
     const response = await fetchWithTimeout(createUrl.toString(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Zoho-oauthtoken ' + token },
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Zoho-oauthtoken ' + token },
       body: JSON.stringify(payload)
     }, 10000);
-    let data = {};
-    try { data = await response.json(); } catch {}
-    const returnedSalesOrder = data.sales_order || data.salesorder || null;
-    const returnedId = returnedSalesOrder?.salesorder_id || data.salesorder_id || null;
-    const providerOk = response.ok && data.code === 0 && Boolean(returnedId);
-    if (!providerOk) {
+    let data = {}; try { data = await response.json(); } catch {}
+    const remote = data.sales_order || data.salesorder || null;
+    const returnedId = remote?.salesorder_id || data.salesorder_id || null;
+    if (!response.ok || Number(data.code) !== 0 || !returnedId) {
       await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'sales_order_create_failed', {
-        order_id: order.order_id, provider_status: response.status,
-        provider_code: data.code ?? null,
+        order_id: order.order_id, provider_status: response.status, provider_code: data.code ?? null,
         provider_message: clean(data.message || data.error || ('HTTP ' + response.status), 200)
       });
-      throw new AppError(
-        'Zoho POS sales order creation failed: ' + clean(data.message || data.error || ('HTTP ' + response.status), 160),
-        'zoho_order_create_failed', 502,
-        { provider_status: response.status, provider_code: data.code ?? null }
-      );
+      throw new AppError('Zoho POS sales order creation failed: ' + clean(data.message || data.error || ('HTTP ' + response.status), 160),
+        'zoho_order_create_failed', 502, { provider_status: response.status, provider_code: data.code ?? null });
     }
-
-    // Save the remote ID before the confirmation request. If confirmation is retried,
-    // the next attempt reuses this exact Zoho document instead of creating another.
     salesOrderId = await storeZohoSalesOrderId(env, tenantId, order.order_id, returnedId);
     createdNow = true;
-    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'sales_order_created_pending_confirmation', {
-      order_id: order.order_id, salesorder_id: salesOrderId
-    });
+    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'sales_order_created_pending_confirmation', { order_id: order.order_id, salesorder_id: salesOrderId });
+  } else {
+    const updateUrl = new URL(url);
+    updateUrl.pathname = updateUrl.pathname.replace(/\/+$/, '') + '/' + encodeURIComponent(salesOrderId);
+    const response = await fetchWithTimeout(updateUrl.toString(), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: 'Zoho-oauthtoken ' + token },
+      body: JSON.stringify(payload)
+    }, 10000);
+    let data = {}; try { data = await response.json(); } catch {}
+    if (!response.ok || Number(data.code) !== 0) {
+      await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'sales_order_update_failed', {
+        order_id: order.order_id, salesorder_id: salesOrderId, provider_status: response.status,
+        provider_code: data.code ?? null, provider_message: clean(data.message || data.error || ('HTTP ' + response.status), 200)
+      });
+      throw new AppError('Zoho POS could not update the existing sales order: ' + clean(data.message || data.error || ('HTTP ' + response.status), 160),
+        'zoho_order_update_failed', 502, { provider_status: response.status, provider_code: data.code ?? null });
+    }
+    await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'sales_order_updated', { order_id: order.order_id, salesorder_id: salesOrderId });
   }
-
+  const statusAfter = await env.DB.prepare('SELECT "status" FROM "orders" WHERE "tenant_id" = ? AND ("order_id" = ? OR "id" = ?) LIMIT 1')
+    .bind(tenantId, order.order_id, order.order_id).first();
+  if (['cancelled', 'canceled'].includes(norm(statusAfter?.status))) {
+    await voidZohoSalesOrder(env, tenantId, order.order_id, salesOrderId);
+    return { pushed: false, cancelled: true, reason: 'order_cancelled_during_zoho_sync' };
+  }
   const confirmUrl = new URL(url);
-  const salesOrdersPath = confirmUrl.pathname.replace(/\/+$/, '');
-  if (!salesOrdersPath.endsWith('/inventory/v1/salesorders')) {
-    throw new AppError('Configured Zoho URL is not the native sales orders endpoint.', 'zoho_pos_url_invalid', 503);
-  }
-  confirmUrl.pathname = salesOrdersPath + '/' + encodeURIComponent(salesOrderId) + '/status/confirmed';
+  const path = confirmUrl.pathname.replace(/\/+$/, '');
+  if (!path.endsWith('/inventory/v1/salesorders')) throw new AppError('Configured Zoho URL is not the native sales orders endpoint.', 'zoho_pos_url_invalid', 503);
+  confirmUrl.pathname = path + '/' + encodeURIComponent(salesOrderId) + '/status/confirmed';
   const confirmResponse = await fetchWithTimeout(confirmUrl.toString(), {
-    method: 'POST',
-    headers: { Authorization: 'Zoho-oauthtoken ' + token }
+    method: 'POST', headers: { Authorization: 'Zoho-oauthtoken ' + token }
   }, 10000);
-  let confirmData = {};
-  try { confirmData = await confirmResponse.json(); } catch {}
-  const confirmed = confirmResponse.ok && confirmData.code === 0;
-  if (!confirmed) {
+  let confirmData = {}; try { confirmData = await confirmResponse.json(); } catch {}
+  if (!confirmResponse.ok || Number(confirmData.code) !== 0) {
     await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'sales_order_confirmation_failed', {
-      order_id: order.order_id, salesorder_id: salesOrderId,
-      provider_status: confirmResponse.status,
-      provider_code: confirmData.code ?? null,
-      provider_message: clean(confirmData.message || confirmData.error || ('HTTP ' + confirmResponse.status), 200)
+      order_id: order.order_id, salesorder_id: salesOrderId, provider_status: confirmResponse.status,
+      provider_code: confirmData.code ?? null, provider_message: clean(confirmData.message || confirmData.error || ('HTTP ' + confirmResponse.status), 200)
     });
-    throw new AppError(
-      'Zoho POS sales order was created but could not be marked Confirmed: ' +
-        clean(confirmData.message || confirmData.error || ('HTTP ' + confirmResponse.status), 160),
-      'zoho_order_confirmation_failed', 502,
-      { provider_status: confirmResponse.status, provider_code: confirmData.code ?? null }
-    );
+    throw new AppError('Zoho POS sales order could not be marked Confirmed: ' + clean(confirmData.message || confirmData.error || ('HTTP ' + confirmResponse.status), 160),
+      'zoho_order_confirmation_failed', 502, { provider_status: confirmResponse.status, provider_code: confirmData.code ?? null });
   }
-
   const confirmedAt = nowIso();
   await env.DB.prepare(
-    'UPDATE `orders` SET `pos_confirmed_at` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `pos_salesorder_id` = ?'
+    'UPDATE "orders" SET "pos_confirmed_at" = ?, "updated_at" = ? WHERE "tenant_id" = ? AND ("order_id" = ? OR "id" = ?) AND "pos_salesorder_id" = ? AND LOWER(COALESCE("status", \'')) NOT IN (\'cancelled\', \'canceled\')'
   ).bind(confirmedAt, confirmedAt, tenantId, order.order_id, order.order_id, salesOrderId).run();
-  await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'confirmed', {
-    order_id: order.order_id, salesorder_id: salesOrderId, created_now: createdNow
-  });
+  await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'confirmed', { order_id: order.order_id, salesorder_id: salesOrderId, created_now: createdNow });
   return { pushed: true, salesorder_id: salesOrderId, created_now: createdNow, confirmed: true };
 }
 
@@ -2120,7 +2119,7 @@ async function loadOrderForWorkflow(env, tenantId, orderId) {
 }
 async function updateOrderStatus(env, tenantId, orderId, status) {
   await env.DB.prepare(
-    'UPDATE `orders` SET `status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?)'
+    "UPDATE `orders` SET `status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
   ).bind(status, nowIso(), tenantId, orderId, orderId).run();
 }
 export class OrderProcessingWorkflow extends WorkflowEntrypoint {
