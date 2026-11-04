@@ -2766,12 +2766,14 @@ async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
   const existing = await env.DB.prepare(
     'SELECT * FROM `manager_status_checks` WHERE `tenant_id` = ? AND `order_reference` = ? AND `caller_hash` = ? ORDER BY `created_at` DESC LIMIT 1'
   ).bind(tenantId, orderId, callerRef).first();
-  if (existing && norm(existing.status) === 'completed' && clean(existing.manager_response || '', 20)) {
+  if (existing && norm(existing.status) === 'completed' &&
+      clean(existing.manager_response || '', 20) &&
+      clean(existing.inbound_call_id || '', 120) === clean(context.callId || '', 120)) {
     return {
       ok: true, order_reference: orderId, current_system_status: orderStatus.status,
       manager_status: existing.manager_response,
       status: 'manager_response_received',
-      message_for_assistant: 'The manager has supplied this status. Tell the customer the manager-reported status clearly. Do not transfer the customer.'
+      message_for_assistant: 'The manager has supplied this status for this call. Tell the customer the manager-reported status clearly. Do not transfer the customer.'
     };
   }
   if (existing && ['initiating', 'calling_manager', 'queued', 'in-progress'].includes(norm(existing.status))) {
