@@ -2104,7 +2104,7 @@ async function pushOrderToZoho(env, tenantId, order) {
   }
   const confirmedAt = nowIso();
   await env.DB.prepare(
-    'UPDATE "orders" SET "pos_confirmed_at" = ?, "updated_at" = ? WHERE "tenant_id" = ? AND ("order_id" = ? OR "id" = ?) AND "pos_salesorder_id" = ? AND LOWER(COALESCE("status", \'')) NOT IN (\'cancelled\', \'canceled\')'
+    "UPDATE \"orders\" SET \"pos_confirmed_at\" = ?, \"updated_at\" = ? WHERE \"tenant_id\" = ? AND (\"order_id\" = ? OR \"id\" = ?) AND \"pos_salesorder_id\" = ? AND LOWER(COALESCE(\"status\", '')) NOT IN ('cancelled', 'canceled')"
   ).bind(confirmedAt, confirmedAt, tenantId, order.order_id, order.order_id, salesOrderId).run();
   await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'confirmed', { order_id: order.order_id, salesorder_id: salesOrderId, created_now: createdNow });
   return { pushed: true, salesorder_id: salesOrderId, created_now: createdNow, confirmed: true };
