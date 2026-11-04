@@ -2332,7 +2332,6 @@ async function requestOrderChange(env, tenantId, args) {
     total, currency: CURRENCY, item_count: priced.length, status: 'updated_within_policy',
     message_for_assistant: 'The complete revised order was saved atomically within the first 5 minutes. The manager and customer receipt dispatch were initiated. Do not claim the POS or kitchen copy was changed automatically.' };
 }
-}
 
 function getBusinessInfo(env) {
   const config = businessConfig(env);
