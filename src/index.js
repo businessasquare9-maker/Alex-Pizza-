@@ -38,7 +38,7 @@ const SLOT_DEFAULT_MINUTES = 90;
 
 const ALLOWED_TABLES = new Set([
   'tenants', 'audit_log', 'bookings', 'business_settings', 'calls',
-  'integration_status', 'manager_tasks', 'manager_status_checks', 'menu_items', 'notifications',
+  'integration_status', 'manager_tasks', 'manager_status_checks', 'call_usage_ticks', 'menu_items', 'notifications',
   'order_change_requests', 'order_items', 'orders', 'zoho_oauth_tokens',
   'monthly_call_usage', 'manual_payments', 'invoices'
 ]);
@@ -99,7 +99,7 @@ const BUSINESS_HINT = /business|store|restaurant|shop|sender|from|signalwire|twi
 const GENERIC_HINT = /^(phone|phone_number|contact_number|whatsapp_number|hotline|support_phone)$/i;
 
 const PURGE_TABLES = [
-  'audit_log', 'bookings', 'calls', 'notifications', 'manager_tasks', 'manager_status_checks',
+  'audit_log', 'bookings', 'calls', 'call_usage_ticks', 'notifications', 'manager_tasks', 'manager_status_checks',
   'order_change_requests', 'order_items', 'orders'
 ];
 
@@ -509,9 +509,10 @@ const SCHEMA_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS `integration_status` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `provider` TEXT, `status` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `menu_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `sku` TEXT, `name` TEXT NOT NULL, `category` TEXT, `size` TEXT, `flavor` TEXT, `price_cents` INTEGER NOT NULL DEFAULT 0, `price` REAL, `active` INTEGER NOT NULL DEFAULT 1, `pos_variant_id` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `bookings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `booking_time` TEXT NOT NULL, `duration_minutes` INTEGER NOT NULL DEFAULT 90, `party_size` INTEGER, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `status` TEXT, `started_at` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `status` TEXT, `started_at` TEXT, `duration_seconds` INTEGER, `billable_minutes` INTEGER NOT NULL DEFAULT 0, `ended_at` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_tasks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `task_id` TEXT, `title` TEXT, `description` TEXT, `priority` TEXT, `status` TEXT, `caller_hash` TEXT, `dedupe_key` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_status_checks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_reference` TEXT NOT NULL, `customer_phone` TEXT, `caller_hash` TEXT, `manager_phone` TEXT, `inbound_call_id` TEXT, `outbound_call_id` TEXT, `status` TEXT, `manager_response` TEXT, `started_at` TEXT, `completed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `call_usage_ticks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT NOT NULL, `minute_index` INTEGER NOT NULL, `month` TEXT NOT NULL, `counted_at` TEXT NOT NULL, `created_at` TEXT NOT NULL, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `notifications` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `notification_id` TEXT, `recipient_phone` TEXT, `sender_phone` TEXT, `message` TEXT, `notification_type` TEXT, `channel` TEXT, `status` TEXT, `provider_message_id` TEXT, `metadata` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `orders` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `order_type` TEXT, `total` REAL NOT NULL DEFAULT 0, `currency` TEXT, `items_json` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `order_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `sku` TEXT, `name` TEXT, `category` TEXT, `unit_price` REAL NOT NULL DEFAULT 0, `quantity` INTEGER NOT NULL DEFAULT 1, `line_total` REAL NOT NULL DEFAULT 0, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
@@ -560,7 +561,10 @@ async function ensureSchema(env) {
       'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER',
       'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT',
       'ALTER TABLE `calls` ADD COLUMN `started_at` TEXT',
-      'ALTER TABLE `calls` ADD COLUMN `status` TEXT'
+      'ALTER TABLE `calls` ADD COLUMN `status` TEXT',
+      'ALTER TABLE `calls` ADD COLUMN `duration_seconds` INTEGER',
+      'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT'
     ]) { try { await env.DB.prepare(migration).run(); } catch {} }
     // Preserve legacy dollar-denominated menu prices when adding the cents column.
     try {
@@ -569,6 +573,7 @@ async function ensureSchema(env) {
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tool_call` ON `orders` (`tenant_id`, `tool_call_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tenant_order_id` ON `orders` (`tenant_id`, `order_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_calls_tenant_call_id` ON `calls` (`tenant_id`, `call_id`)').run(); } catch {}
+    try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_call_usage_tick` ON `call_usage_ticks` (`tenant_id`, `call_id`, `minute_index`)').run(); } catch {}
     try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS `idx_manager_status_order` ON `manager_status_checks` (`tenant_id`, `order_reference`, `created_at`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_manager_status_outbound_call` ON `manager_status_checks` (`tenant_id`, `outbound_call_id`)').run(); } catch {}
     columnCache.clear();
@@ -1346,56 +1351,74 @@ async function run60DayDataPurge(env) {
   }
   return { ok: true, purgedRecords, cutoffDate: cutoff, retentionDays: RETENTION_DAYS, tables };
 }
-async function recordCallMinutes(env, tenantId, durationSeconds, endedAt) {
+async function addMonthlyUsageMinute(env, tenantId, monthKey, countedAt) {
+  await env.DB.prepare(
+    "INSERT INTO `monthly_call_usage` (`tenant_id`, `month`, `total_minutes`, `last_call_at`, `status`, `updated_at`) VALUES (?, ?, 1, ?, 'active', ?) ON CONFLICT(`tenant_id`, `month`) DO UPDATE SET `total_minutes` = `monthly_call_usage`.`total_minutes` + 1, `last_call_at` = excluded.`last_call_at`, `status` = 'active', `updated_at` = excluded.`updated_at`"
+  ).bind(tenantId, monthKey, countedAt, nowIso()).run();
+  const row = await env.DB.prepare(
+    'SELECT `total_minutes` FROM `monthly_call_usage` WHERE `tenant_id` = ? AND `month` = ? LIMIT 1'
+  ).bind(tenantId, monthKey).first();
+  return Number(row?.total_minutes || 0);
+}
+async function recordCallMinuteTick(env, tenantId, callId, minuteIndex, countedAt) {
+  const at = new Date(countedAt);
+  if (Number.isNaN(at.getTime())) throw new AppError('Invalid call usage tick time.', 'invalid_call_timestamp', 400);
+  const monthKey = localDateForTimeZone(at, TIME_ZONE_DEFAULT).slice(0, 7);
+  const tickId = callId + ':' + String(minuteIndex);
+  const inserted = await env.DB.prepare(
+    'INSERT OR IGNORE INTO `call_usage_ticks` (`tenant_id`, `id`, `call_id`, `minute_index`, `month`, `counted_at`, `created_at`) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(tenantId, tickId, callId, minuteIndex, monthKey, at.toISOString(), nowIso()).run();
+  if (Number(inserted.meta?.changes || 0) !== 1) return { counted: false, month: monthKey };
+  const monthlyTotal = await addMonthlyUsageMinute(env, tenantId, monthKey, at.toISOString());
+  await env.DB.prepare(
+    'UPDATE `calls` SET `billable_minutes` = MAX(COALESCE(`billable_minutes`, 0), ?) WHERE `tenant_id` = ? AND `call_id` = ?'
+  ).bind(minuteIndex, tenantId, callId).run();
+  return { counted: true, month: monthKey, monthlyTotal };
+}
+async function recordCallMinutes(env, tenantId, durationSeconds, endedAt, callId = '') {
   await ensureSchema(env);
   const seconds = Math.max(1, Math.min(86400, Number(durationSeconds) || DEFAULT_CALL_SECONDS));
-  const minutes = Math.ceil(seconds / 60);
-  const now = endedAt ? new Date(endedAt) : new Date();
-  if (!Number.isFinite(now.getTime())) throw new AppError('Invalid call end timestamp.', 'invalid_call_timestamp', 400);
-  const monthParts = zonedParts(now, TIME_ZONE_DEFAULT);
-  const monthKey = monthParts.year + '-' + String(monthParts.month).padStart(2, '0');
-  const columns = await getColumns(env, 'monthly_call_usage');
-  const scopeColumn = findColumn(columns, TENANT_COLUMNS);
-  const monthColumn = findColumn(columns, ['month', 'month_key', 'billing_month']);
-  const minutesColumn = findColumn(columns, ['total_minutes', 'minutes', 'minutes_used']);
-  const lastCallColumn = findColumn(columns, ['last_call_at', 'last_call']);
-  const statusColumn = findColumn(columns, ['status']);
-  const updatedColumn = findColumn(columns, ['updated_at']);
-  if (!scopeColumn || !monthColumn || !minutesColumn) {
-    throw new AppError('monthly_call_usage schema is incomplete.', 'usage_schema_incomplete', 500);
+  const totalMinutes = Math.ceil(seconds / 60);
+  const ended = endedAt ? new Date(endedAt) : new Date();
+  if (Number.isNaN(ended.getTime())) throw new AppError('Invalid call end timestamp.', 'invalid_call_timestamp', 400);
+  const id = clean(callId, 120);
+  const callRow = id ? await env.DB.prepare(
+    'SELECT `started_at`, `created_at`, `billable_minutes` FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+  ).bind(tenantId, id).first() : null;
+  const alreadyCounted = Math.max(0, Number(callRow?.billable_minutes || 0));
+  const startMs = Date.parse(callRow?.started_at || callRow?.created_at || new Date(ended.getTime() - seconds * 1000).toISOString());
+  const start = Number.isFinite(startMs) ? startMs : ended.getTime() - seconds * 1000;
+  const missing = Math.max(0, totalMinutes - alreadyCounted);
+  const monthTotals = {};
+  for (let index = alreadyCounted + 1; index <= totalMinutes; index++) {
+    const tickTime = index === totalMinutes ? ended : new Date(Math.min(ended.getTime(), start + index * 60000));
+    if (id) {
+      const tick = await recordCallMinuteTick(env, tenantId, id, index, tickTime);
+      if (tick.counted) monthTotals[tick.month] = tick.monthlyTotal;
+    } else {
+      const month = localDateForTimeZone(tickTime, TIME_ZONE_DEFAULT).slice(0, 7);
+      monthTotals[month] = await addMonthlyUsageMinute(env, tenantId, month, tickTime.toISOString());
+    }
   }
-
-  if (monthParts.day === 1 && monthParts.hour === 0 && monthParts.minute < 10 && statusColumn) {
+  if (id) {
     await env.DB.prepare(
-      `UPDATE ${q('monthly_call_usage')} SET ${q(statusColumn)} = 'archived' WHERE ${q(scopeColumn)} = ? AND ${q(monthColumn)} < ?`
-    ).bind(tenantId, monthKey).run();
+      'UPDATE `calls` SET `billable_minutes` = MAX(COALESCE(`billable_minutes`, 0), ?), `duration_seconds` = ?, `ended_at` = ?, `status` = ? WHERE `tenant_id` = ? AND `call_id` = ?'
+    ).bind(totalMinutes, Math.ceil(seconds), ended.toISOString(), 'ended', tenantId, id).run();
   }
-
-  const set = [`${q(minutesColumn)} = ${q(minutesColumn)} + ?`];
-  const setParams = [minutes];
-  if (lastCallColumn) { set.push(`${q(lastCallColumn)} = ?`); setParams.push(now.toISOString()); }
-  if (statusColumn) set.push(`${q(statusColumn)} = 'active'`);
-  if (updatedColumn) { set.push(`${q(updatedColumn)} = ?`); setParams.push(nowIso()); }
-  const updated = await env.DB.prepare(
-    `UPDATE ${q('monthly_call_usage')} SET ${set.join(', ')} WHERE ${q(scopeColumn)} = ? AND ${q(monthColumn)} = ?`
-  ).bind(...setParams, tenantId, monthKey).run();
-
-  if (!Number(updated.meta?.changes || 0)) {
-    const data = { [scopeColumn]: tenantId, [monthColumn]: monthKey, [minutesColumn]: minutes };
-    if (lastCallColumn) data[lastCallColumn] = now.toISOString();
-    if (statusColumn) data[statusColumn] = 'active';
-    if (updatedColumn) data[updatedColumn] = nowIso();
-    const keys = Object.keys(data);
-    await env.DB.prepare(
-      `INSERT INTO ${q('monthly_call_usage')} (${keys.map(key => q(key)).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`
-    ).bind(...keys.map(key => data[key])).run();
-  }
-
-  const totalRow = await env.DB.prepare(
-    `SELECT ${q(minutesColumn)} AS total_minutes FROM ${q('monthly_call_usage')} WHERE ${q(scopeColumn)} = ? AND ${q(monthColumn)} = ?`
-  ).bind(tenantId, monthKey).first();
-  return { currentMonth: monthKey, addedMinutes: minutes, monthlyTotal: Number(totalRow?.total_minutes || minutes) };
+  const currentMonth = localDateForTimeZone(ended, TIME_ZONE_DEFAULT).slice(0, 7);
+  const current = await env.DB.prepare(
+    'SELECT `total_minutes` FROM `monthly_call_usage` WHERE `tenant_id` = ? AND `month` = ? LIMIT 1'
+  ).bind(tenantId, currentMonth).first();
+  return {
+    currentMonth,
+    addedMinutes: missing,
+    monthlyTotal: Number(current?.total_minutes || 0),
+    totalBillableMinutes: totalMinutes,
+    alreadyCountedMinutes: alreadyCounted,
+    monthTotals
+  };
 }
+
 async function setNotificationStatus(env, tenantId, notificationId, status, providerMessageId) {
   try {
     const columns = await getColumns(env, 'notifications');
@@ -2467,13 +2490,20 @@ async function recordInboundCallStart(env, tenantId, call) {
   await insertScoped(env, 'calls', tenantId, [
     [['id'], callId], [['call_id'], callId],
     [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? (phone || null) : null],
-    [['caller_hash'], callerRef],
-    [['purpose'], 'Inbound Vapi call'],
+    [['caller_hash'], callerRef], [['purpose'], 'Inbound Vapi call'],
     [['direction'], clean(call?.type || 'inboundPhoneCall', 40)],
-    [['status'], 'in_progress'],
-    [['started_at'], startedAt],
-    [['created_at'], startedAt]
+    [['status'], 'in_progress'], [['started_at'], startedAt],
+    [['billable_minutes'], 0], [['created_at'], startedAt]
   ]);
+  if (env.CALL_USAGE_WORKFLOW && typeof env.CALL_USAGE_WORKFLOW.create === 'function') {
+    try {
+      await env.CALL_USAGE_WORKFLOW.create({ id: 'call-usage-' + callId, params: { tenant_id: tenantId, call_id: callId } });
+    } catch (err) {
+      await recordIntegrationStatus(env, tenantId, 'call_usage_workflow', 'start_failed', {
+        call_id: callId, code: clean(err?.code || 'call_usage_workflow_failed', 80)
+      });
+    }
+  }
 
   if (!phone || priorCount < 1) {
     return { recorded: true, call_id: callId, repeat: false, call_count: priorCount + 1 };
@@ -2912,7 +2942,7 @@ async function handleVapiEvents(request, env, tenantId) {
   if (seen) return json(request, env, { ok: true, duplicate: true, manager_status: managerResult });
 
   const endedAt = message.endedAt || nowIso();
-  const usage = await recordCallMinutes(env, tenantId, seconds, endedAt);
+  const usage = await recordCallMinutes(env, tenantId, seconds, endedAt, callId);
   const existingCall = await env.DB.prepare(
     'SELECT 1 FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
   ).bind(tenantId, callId).first();
@@ -3213,6 +3243,33 @@ async function handleScheduled(env) {
   } catch (err) {
     safeLog(err);
     return { ok: false, ...publicError(err) };
+  }
+}
+
+export class CallUsageWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    const tenantId = validateTenant(event?.payload?.tenant_id);
+    const callId = clean(event?.payload?.call_id || '', 120);
+    if (!callId) throw new AppError('Call usage workflow requires call_id.', 'call_id_required', 400);
+    await ensureSchema(this.env);
+    for (let minuteIndex = 1; minuteIndex <= 720; minuteIndex++) {
+      await step.sleep('wait-for-call-minute-' + minuteIndex, '1 minute');
+      const tick = await step.do('count-call-minute-' + minuteIndex, {
+        retries: { limit: 5, delay: '5 seconds', backoff: 'exponential' }, timeout: '30 seconds'
+      }, async () => {
+        const call = await this.env.DB.prepare(
+          'SELECT `status`, `started_at`, `created_at` FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+        ).bind(tenantId, callId).first();
+        if (!call || norm(call.status) !== 'in_progress') return { active: false, reason: 'call_ended' };
+        const startMs = Date.parse(call.started_at || call.created_at || '');
+        if (!Number.isFinite(startMs)) return { active: false, reason: 'call_start_time_missing' };
+        const countedAt = new Date(startMs + minuteIndex * 60000);
+        if (Date.now() < countedAt.getTime()) return { active: true, counted: false, reason: 'minute_not_reached' };
+        return { active: true, ...await recordCallMinuteTick(this.env, tenantId, callId, minuteIndex, countedAt) };
+      });
+      if (!tick.active) return { ok: true, call_id: callId, completed_after_minutes: minuteIndex - 1, reason: tick.reason };
+    }
+    return { ok: true, call_id: callId, status: 'maximum_tracked_duration_reached', tracked_minutes: 720 };
   }
 }
 
