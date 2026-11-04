@@ -2002,7 +2002,7 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
     const tenantId = validateTenant(event?.payload?.tenant_id);
     const orderId = clean(event?.payload?.order_id, 100);
-    await ensureTenantActive(this.env, tenantId);
+    await ensureTenantRecord(this.env, tenantId);
     if (!orderId) throw new AppError('Workflow order_id is required.', 'order_id_required', 400);
     const order = await step.do('load-order-' + orderId, async () =>
       await loadOrderForWorkflow(this.env, tenantId, orderId)
@@ -3108,16 +3108,27 @@ async function executeToolCall(env, tenantId, call, index, ctx) {
     return toolResult(callId, publicError(err));
   }
 }
-async function ensureTenantActive(env, tenantId) {
+async function ensureTenantRecord(env, tenantId) {
   await ensureSchema(env);
-  let tenant = await env.DB.prepare('SELECT `tenant_id`, `status`, `suspended_reason` FROM `tenants` WHERE `tenant_id` = ? LIMIT 1').bind(tenantId).first();
+  let tenant = await env.DB.prepare(
+    'SELECT `tenant_id`, `status`, `suspended_reason` FROM `tenants` WHERE `tenant_id` = ? LIMIT 1'
+  ).bind(tenantId).first();
   if (!tenant && tenantId === DEFAULT_TENANT) {
-    await env.DB.prepare('INSERT OR IGNORE INTO `tenants` (`tenant_id`, `name`, `timezone`, `status`, `created_at`, `updated_at`) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(tenantId, 'Alex Pizza NYC', TIME_ZONE_DEFAULT, 'active', nowIso(), nowIso()).run();
-    tenant = await env.DB.prepare('SELECT `tenant_id`, `status`, `suspended_reason` FROM `tenants` WHERE `tenant_id` = ? LIMIT 1').bind(tenantId).first();
+    await env.DB.prepare(
+      'INSERT OR IGNORE INTO `tenants` (`tenant_id`, `name`, `timezone`, `status`, `created_at`, `updated_at`) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(tenantId, 'Alex Pizza NYC', TIME_ZONE_DEFAULT, 'active', nowIso(), nowIso()).run();
+    tenant = await env.DB.prepare(
+      'SELECT `tenant_id`, `status`, `suspended_reason` FROM `tenants` WHERE `tenant_id` = ? LIMIT 1'
+    ).bind(tenantId).first();
   }
   if (!tenant) throw new AppError('Tenant is not provisioned.', 'tenant_not_provisioned', 403);
-  if (norm(tenant.status || 'active') !== 'active') throw new AppError('This AI calling service is temporarily suspended. Please contact the business administrator.', 'tenant_suspended', 403);
+  return tenant;
+}
+async function ensureTenantActive(env, tenantId) {
+  const tenant = await ensureTenantRecord(env, tenantId);
+  if (norm(tenant.status || 'active') !== 'active') {
+    throw new AppError('This AI calling service is temporarily suspended. Please contact the business administrator.', 'tenant_suspended', 403);
+  }
   return tenant;
 }
 
@@ -3153,7 +3164,7 @@ async function handleVapiEvents(request, env, tenantId) {
   await requireToolAuth(request, env);
   const blocked = requireMethod(request, env, 'POST');
   if (blocked) return blocked;
-  await ensureTenantActive(env, tenantId);
+  await ensureTenantRecord(env, tenantId);
   const toolRequest = request.clone();
   const body = await readJson(request, env);
   const message = body?.message && typeof body.message === 'object' ? body.message : body;
@@ -3240,7 +3251,7 @@ async function authenticateClientDashboard(request, env) {
   ).bind(digest).first();
   if (!tenant) throw new AppError('Invalid client dashboard token.', 'unauthorized', 401);
   const tenantId = validateTenant(tenant.tenant_id);
-  await ensureTenantActive(env, tenantId);
+  await ensureTenantRecord(env, tenantId);
   return tenantId;
 }
 
@@ -3640,7 +3651,7 @@ async function handleFetch(request, env, ctx) {
       await requireManagerDashboardAuth(request, env);
       const tenantId = validateTenant(url.searchParams.get('tenant_id') || DEFAULT_TENANT);
       if (tenantId !== DEFAULT_TENANT) throw new AppError('Provider-wide access is not available through the restaurant manager token. Use the provider admin API or the tenant client token.', 'tenant_scope_forbidden', 403);
-      await ensureTenantActive(env, tenantId);
+      await ensureTenantRecord(env, tenantId);
       const result = await collectManagerData(env, tenantId);
       if (path === '/manager/export') {
         return new Response(JSON.stringify(result, null, 2), { status: 200, headers: { ...responseHeaders(request, env), 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="${tenantId}-retained-data.json"` } });
@@ -3719,7 +3730,7 @@ export class BookingCalendarWorkflow extends WorkflowEntrypoint {
     const tenantId = validateTenant(event?.payload?.tenant_id);
     const bookingId = clean(event?.payload?.booking_id || '', 100);
     if (!bookingId) throw new AppError('Booking Calendar workflow requires booking_id.', 'booking_id_required', 400);
-    await ensureTenantActive(this.env, tenantId);
+    await ensureTenantRecord(this.env, tenantId);
 
     const booking = await step.do('load-calendar-booking-' + bookingId, async () => {
       const columns = await getColumns(this.env, 'bookings');
@@ -3800,7 +3811,7 @@ export class NotificationDeliveryWorkflow extends WorkflowEntrypoint {
     const tenantId = validateTenant(event?.payload?.tenant_id);
     const notificationId = clean(event?.payload?.notification_id || '', 100);
     if (!notificationId) throw new AppError('Notification workflow requires notification_id.', 'notification_id_required', 400);
-    await ensureTenantActive(this.env, tenantId);
+    await ensureTenantRecord(this.env, tenantId);
     const retryDelays = ['30 seconds', '1 minute', '3 minutes', '10 minutes'];
     for (let attempt = 1; attempt <= 5; attempt++) {
       if (attempt > 1) await step.sleep('notification-retry-delay-' + attempt, retryDelays[attempt - 2]);
