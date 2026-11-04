@@ -15,5 +15,10 @@ binding = "ORDER_WORKFLOW"
 name = "alex-pizza-order-processing"
 class_name = "OrderProcessingWorkflow"
 
+[[workflows]]
+binding = "CALL_USAGE_WORKFLOW"
+name = "alex-pizza-live-call-usage"
+class_name = "CallUsageWorkflow"
+
 [triggers]
-crons = ["17 3 * * *"]
+crons = ["17 10 * * *"]
