@@ -1804,13 +1804,14 @@ async function pushOrderToZoho(env, tenantId, order) {
   }, 10000);
   let data = {};
   try { data = await response.json(); } catch {}
-  const providerOk = response.ok && (data.code === 0 || data.code === undefined) &&
-    Boolean(data.salesorder || data.salesorder_id || data.message === 'success');
+  const returnedSalesOrder = data.sales_order || data.salesorder || null;
+  const returnedSalesOrderId = returnedSalesOrder?.salesorder_id || data.salesorder_id || null;
+  const providerOk = response.ok && data.code === 0 && Boolean(returnedSalesOrder || data.message === 'success');
   await recordIntegrationStatus(env, tenantId, 'zoho_pos', providerOk ? 'ok' : 'error', {
     order_id: order.order_id,
     provider_status: response.status,
     provider_code: data.code ?? null,
-    salesorder_id: data.salesorder?.salesorder_id || data.salesorder_id || null
+    salesorder_id: returnedSalesOrderId
   });
   if (!providerOk) {
     throw new AppError(
@@ -1822,7 +1823,7 @@ async function pushOrderToZoho(env, tenantId, order) {
   return {
     pushed: true,
     provider_status: response.status,
-    salesorder_id: data.salesorder?.salesorder_id || data.salesorder_id || null
+    salesorder_id: returnedSalesOrderId
   };
 }
 
@@ -3162,6 +3163,38 @@ async function handleAdmin(request, env, url, path) {
   if (path === '/admin/sync-menu') {
     const result = await syncAndReplaceD1Menu(env, tenantId);
     return json(request, env, { ok: true, result });
+  }
+  if (path === '/admin/map-menu-pos-items') {
+    await ensureSchema(env);
+    if (!Array.isArray(body.items) || !body.items.length || body.items.length > MAX_MENU_ROWS) {
+      throw new AppError('items must be a non-empty array with no more than ' + MAX_MENU_ROWS + ' rows.', 'invalid_menu_mapping_rows', 400);
+    }
+    const columns = await getColumns(env, 'menu_items');
+    const scopeColumn = findColumn(columns, TENANT_COLUMNS);
+    const skuColumn = findColumn(columns, ['sku', 'id', 'menu_item_id']);
+    const posColumn = findColumn(columns, ['pos_variant_id', 'zoho_item_id', 'pos_item_id']);
+    if (!scopeColumn || !skuColumn || !posColumn) throw new AppError('D1 menu_items table is missing SKU or POS mapping columns.', 'menu_mapping_schema_incomplete', 500);
+    const updates = [];
+    const validSkus = [];
+    const invalid = [];
+    for (const row of body.items) {
+      const sku = clean(row?.sku || '', 80);
+      const posId = String(row?.pos_variant_id ?? row?.zoho_item_id ?? '').trim();
+      if (!sku || !/^[0-9]{1,24}$/.test(posId)) {
+        invalid.push({ sku: sku || null, reason: 'A SKU and a numeric Zoho POS item ID are required.' });
+        continue;
+      }
+      validSkus.push(sku);
+      updates.push(env.DB.prepare(
+        'UPDATE `menu_items` SET ' + q(posColumn) + ' = ? WHERE ' + q(scopeColumn) + ' = ? AND LOWER(' + q(skuColumn) + ') = LOWER(?)'
+      ).bind(posId, tenantId, sku));
+    }
+    const results = updates.length ? await env.DB.batch(updates) : [];
+    const mapped = results.reduce((sum, result) => sum + Number(result.meta?.changes || 0), 0);
+    const notFound = results.map((result, index) => Number(result.meta?.changes || 0) === 0 ? validSkus[index] : null).filter(Boolean);
+    await audit(env, tenantId, 'zoho_menu_item_mapping_updated', { mapped, invalid_rows: invalid.length, sku_not_found: notFound.length });
+    return json(request, env, { ok: true, tenant_id: tenantId, mapped, unmatched_skus: notFound, invalid_rows: invalid,
+      note: 'Only supplied numeric IDs were saved. No Zoho IDs were generated or guessed.' });
   }
   if (path === '/admin/purge-60-days') {
     const result = await run60DayDataPurge(env);
