@@ -2783,8 +2783,16 @@ const TOOL_HANDLERS = {
   async submit_order(env, tenantId, args, ctx) {
     return await submitOrder(env, tenantId, args, ctx);
   },
-  async get_order_status(env, tenantId, args) {
-    return await getOrderStatus(env, tenantId, args);
+  async get_order_status(env, tenantId, args, ctx) {
+    const verifiedOrder = await getOrderStatus(env, tenantId, args);
+    const managerCheck = await requestManagerStatusCheck(env, tenantId, args, ctx);
+    return {
+      ...verifiedOrder,
+      manager_check: managerCheck,
+      message_for_assistant: managerCheck.status === 'manager_response_received'
+        ? 'The manager response has been received. Relay the manager-reported status to the customer; do not transfer.'
+        : 'The order reference and customer phone were verified. The AI has contacted or is contacting the manager. Keep the customer with the AI, ask them to hold, and call request_manager_status_check again with the same order reference and phone to retrieve the manager reply. Never invent a status.'
+    };
   },
   async request_order_change(env, tenantId, args) {
     return await requestOrderChange(env, tenantId, args);
@@ -2825,7 +2833,7 @@ const TOOL_CATALOG = [
   { name: 'request_order_cancel', description: 'Cancel only within the first 5 minutes after verifying both order reference and customer phone. After 5 minutes cancellation is never allowed; do not create a replacement order from a cancellation request.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
   { name: 'submit_order', description: 'Submit customer-confirmed pickup or delivery order. POS confirmation is asynchronous; report pending until confirmed.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, notes: { type: 'string' }, order_type: { type: 'string', enum: ['pickup', 'delivery'] }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, delivery_address: { type: 'string' }, customer_confirmed: { type: 'boolean' }, related_order_reference: { type: 'string' }, deliver_with_original: { type: 'boolean' } }, required: ['customer_name', 'customer_phone', 'order_type', 'items', 'customer_confirmed'], additionalProperties: false } },
   { name: 'request_order_change', description: '0-5 minutes: replace the complete order after customer confirmation. 5-20 minutes: only add items to the existing bill after confirmation; no cancellation or removals. After 20 minutes: original bill is locked; offer a separate linked order delivered with the original.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' }, requested_changes: { type: 'string' }, items: { type: 'array', items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, customer_confirmed: { type: 'boolean' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'requested_changes'], additionalProperties: false } },
-  { name: 'check_order_status', description: 'Look up an order after matching its reference and customer phone.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
+  { name: 'check_order_status', description: 'Verify customer phone and order reference, automatically call the manager for the latest order status, keep the customer with the AI and return the manager reply when available.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
   { name: 'get_business_hours', description: 'Return business hours, time zone and reservation cutoff.', parameters: { type: 'object', properties: {}, required: [], additionalProperties: false } },
   { name: 'calculate_order_tool', description: 'Calculate a price estimate from active D1 menu items without submitting an order.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } } }, required: ['items'], additionalProperties: false } },
   { name: 'get_menu', description: 'Return active Alex Pizza menu items and prices.', parameters: { type: 'object', properties: {}, required: [], additionalProperties: false } }
