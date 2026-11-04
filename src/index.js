@@ -1776,6 +1776,132 @@ async function loadZohoItemIdMap(env, tenantId) {
   }
   return map;
 }
+
+async function listZohoPosItems(env, tenantId) {
+  const organizationId = envValue(env, ENV_KEYS.zohoOrganization);
+  if (!organizationId) throw new AppError('ZOHO_ORGANIZATION_ID is required to list Zoho POS items.', 'zoho_organization_id_missing', 503);
+  const token = await getZohoAccessToken(env, tenantId);
+  const base = (envValue(env, ENV_KEYS.zohoApiBaseUrl) || 'https://api.zakya.com').replace(/\/+$/, '');
+  const items = [];
+  for (let page = 1; page <= 20; page++) {
+    const url = new URL(base + '/inventory/v1/items');
+    url.searchParams.set('organization_id', organizationId);
+    url.searchParams.set('page', String(page));
+    url.searchParams.set('per_page', '200');
+    const response = await fetchWithTimeout(url.toString(), {
+      method: 'GET',
+      headers: { Authorization: 'Zoho-oauthtoken ' + token }
+    }, 10000);
+    let data = {};
+    try { data = await response.json(); } catch {}
+    if (!response.ok || Number(data.code) !== 0 || !Array.isArray(data.items)) {
+      throw new AppError('Zoho POS item list failed: ' + clean(data.message || data.error || ('HTTP ' + response.status), 180),
+        'zoho_item_list_failed', 502, { provider_status: response.status, provider_code: data.code ?? null });
+    }
+    items.push(...data.items);
+    const more = Boolean(data.page_context?.has_more_page || data.page_context?.has_more_pages);
+    if (!more) break;
+    if (page === 20) throw new AppError('Zoho POS item list exceeds the safe 4,000-item mapping scan limit.', 'zoho_item_list_limit_exceeded', 502);
+  }
+  return items;
+}
+
+async function buildZohoMenuMappingReport(env, tenantId) {
+  await ensureSchema(env);
+  const columns = await getColumns(env, 'menu_items');
+  const scopeColumn = findColumn(columns, TENANT_COLUMNS);
+  const skuColumn = findColumn(columns, ['sku', 'id', 'menu_item_id']);
+  const nameColumn = findColumn(columns, ['name', 'item_name', 'title']);
+  const centsColumn = findColumn(columns, ['price_cents']);
+  const legacyPriceColumn = findColumn(columns, ['price', 'unit_price']);
+  const posColumn = findColumn(columns, ['pos_variant_id', 'zoho_item_id', 'pos_item_id']);
+  if (!scopeColumn || !skuColumn || !nameColumn || (!centsColumn && !legacyPriceColumn) || !posColumn) {
+    throw new AppError('D1 menu_items schema does not contain the required SKU, price and POS mapping columns.', 'menu_mapping_schema_incomplete', 500);
+  }
+  const priceExpression = centsColumn ? q(centsColumn) : 'CAST(ROUND(' + q(legacyPriceColumn) + ' * 100) AS INTEGER)';
+  const local = await env.DB.prepare(
+    'SELECT ' + q(skuColumn) + ' AS sku, ' + q(nameColumn) + ' AS name, ' +
+    priceExpression + ' AS price_cents, ' + q(posColumn) + ' AS pos_variant_id ' +
+    'FROM "menu_items" WHERE ' + q(scopeColumn) + ' = ? ORDER BY ' + q(skuColumn)
+  ).bind(tenantId).all();
+  const remoteItems = await listZohoPosItems(env, tenantId);
+  const remoteBySku = new Map();
+  for (const item of remoteItems) {
+    const sku = norm(item?.sku);
+    if (!sku) continue;
+    if (!remoteBySku.has(sku)) remoteBySku.set(sku, []);
+    remoteBySku.get(sku).push(item);
+  }
+  const rows = (local.results || []).map(row => {
+    const sku = clean(row.sku, 80);
+    const currentId = clean(row.pos_variant_id || '', 40);
+    const expectedCents = Math.round(Number(row.price_cents) || 0);
+    const candidates = remoteBySku.get(norm(sku)) || [];
+    if (!sku) return { sku: null, status: 'invalid_local_sku', mapped: false };
+    if (candidates.length === 0) return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      existing_pos_variant_id: currentId || null, status: 'zoho_sku_not_found', mapped: false
+    };
+    if (candidates.length > 1) return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      candidate_count: candidates.length, status: 'duplicate_zoho_sku', mapped: false
+    };
+    const item = candidates[0];
+    const id = String(item.item_id ?? '').trim();
+    const remoteCents = Math.round(Number(item.rate) * 100);
+    const active = norm(item.status) === 'active' && item.can_be_sold !== false;
+    if (!/^[0-9]{1,24}$/.test(id)) return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      status: 'invalid_zoho_item_id', mapped: false
+    };
+    if (!active) return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      zoho_item_id: id, zoho_status: clean(item.status || 'unknown', 40),
+      status: 'zoho_item_not_active_or_not_sellable', mapped: false
+    };
+    if (!Number.isFinite(remoteCents) || remoteCents !== expectedCents) return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      zoho_item_id: id, zoho_rate_cents: Number.isFinite(remoteCents) ? remoteCents : null,
+      status: 'price_mismatch', mapped: false
+    };
+    if (currentId && currentId !== id) return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      existing_pos_variant_id: currentId, zoho_item_id: id,
+      status: 'existing_mapping_conflict', mapped: false
+    };
+    return {
+      sku, name: clean(row.name, 180), price_cents: expectedCents,
+      zoho_item_id: id, zoho_name: clean(item.name, 180), zoho_rate_cents: remoteCents,
+      status: currentId === id ? 'already_mapped_exact_match' : 'exact_match_ready',
+      mapped: true
+    };
+  });
+  return {
+    tenant_id: tenantId, local_menu_count: rows.length, zoho_items_scanned: remoteItems.length,
+    exact_matches: rows.filter(row => row.mapped).length,
+    needs_attention: rows.filter(row => !row.mapped).length, rows
+  };
+}
+
+async function applyZohoMenuMapping(env, tenantId, report) {
+  const columns = await getColumns(env, 'menu_items');
+  const scopeColumn = findColumn(columns, TENANT_COLUMNS);
+  const skuColumn = findColumn(columns, ['sku', 'id', 'menu_item_id']);
+  const posColumn = findColumn(columns, ['pos_variant_id', 'zoho_item_id', 'pos_item_id']);
+  const updates = [];
+  for (const row of report.rows) {
+    if (row.status !== 'exact_match_ready' || !row.zoho_item_id) continue;
+    updates.push(env.DB.prepare(
+      'UPDATE "menu_items" SET ' + q(posColumn) + ' = ? WHERE ' + q(scopeColumn) +
+      ' = ? AND LOWER(' + q(skuColumn) + ') = LOWER(?) AND (' + q(posColumn) + ' IS NULL OR ' + q(posColumn) + ' = ?)'
+    ).bind(row.zoho_item_id, tenantId, row.sku, ''));
+  }
+  const results = updates.length ? await env.DB.batch(updates) : [];
+  const applied = results.reduce((sum, result) => sum + Number(result.meta?.changes || 0), 0);
+  const refreshed = await buildZohoMenuMappingReport(env, tenantId);
+  return { ...refreshed, applied_now: applied };
+}
+
 function zohoSalesOrdersUrl(env) {
   const configuredOrderUrl = envValue(env, ENV_KEYS.zohoPosUrl);
   const apiBase = (envValue(env, ENV_KEYS.zohoApiBaseUrl) || 'https://api.zakya.com').replace(/\/+$/, '');
@@ -1837,8 +1963,7 @@ async function pushOrderToZoho(env, tenantId, order) {
       !envValue(env, ENV_KEYS.zohoClientSecret) ? 'ZOHO_CLIENT_SECRET' : '',
       !envValue(env, ENV_KEYS.zohoRefreshToken) ? 'ZOHO_REFRESH_TOKEN' : '',
       !orgId ? 'ZOHO_ORGANIZATION_ID' : '',
-      !customerId ? 'ZOHO_CUSTOMER_ID' : '',
-      !envValue(env, ENV_KEYS.zohoItemIdMap) ? 'ZOHO_ITEM_ID_MAP' : ''
+      !customerId ? 'ZOHO_CUSTOMER_ID' : ''
     ].filter(Boolean);
     await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', {
       order_id: order.order_id, missing
