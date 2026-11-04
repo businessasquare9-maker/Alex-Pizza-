@@ -2104,6 +2104,13 @@ async function pushOrderToZoho(env, tenantId, order) {
     throw new AppError('Zoho POS sales order could not be marked Confirmed: ' + clean(confirmData.message || confirmData.error || ('HTTP ' + confirmResponse.status), 160),
       'zoho_order_confirmation_failed', 502, { provider_status: confirmResponse.status, provider_code: confirmData.code ?? null });
   }
+  const finalStatus = await env.DB.prepare(
+    'SELECT `status` FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) LIMIT 1'
+  ).bind(tenantId, order.order_id, order.order_id).first();
+  if (['cancelled', 'canceled'].includes(norm(finalStatus?.status))) {
+    await voidZohoSalesOrder(env, tenantId, order.order_id, salesOrderId);
+    return { pushed: false, cancelled: true, reason: 'order_cancelled_during_zoho_confirmation' };
+  }
   const confirmedAt = nowIso();
   await env.DB.prepare(
     "UPDATE \"orders\" SET \"pos_confirmed_at\" = ?, \"updated_at\" = ? WHERE \"tenant_id\" = ? AND (\"order_id\" = ? OR \"id\" = ?) AND \"pos_salesorder_id\" = ? AND LOWER(COALESCE(\"status\", '')) NOT IN ('cancelled', 'canceled')"
@@ -2158,9 +2165,10 @@ async function releaseOrderPosLock(env, tenantId, orderId, owner) {
 }
 
 async function updateOrderStatus(env, tenantId, orderId, status) {
-  await env.DB.prepare(
+  const result = await env.DB.prepare(
     "UPDATE `orders` SET `status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
   ).bind(status, nowIso(), tenantId, orderId, orderId).run();
+  return Number(result.meta?.changes || 0) === 1;
 }
 export class OrderProcessingWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
@@ -2235,7 +2243,14 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
       }
       if (result?.pushed) {
         await step.do('mark-pos-confirmed-under-pos-lock', async () => {
-          await updateOrderStatus(this.env, tenantId, orderId, 'pos_confirmed');
+          const changed = await updateOrderStatus(this.env, tenantId, orderId, 'pos_confirmed');
+          const latest = await this.env.DB.prepare(
+            'SELECT `status` FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) LIMIT 1'
+          ).bind(tenantId, orderId, orderId).first();
+          if (!changed || ['cancelled', 'canceled'].includes(norm(latest?.status))) {
+            if (result.salesorder_id) await voidZohoSalesOrder(this.env, tenantId, orderId, result.salesorder_id);
+            return { status: 'cancelled', cancelled_during_pos_confirmation: true };
+          }
           await audit(this.env, tenantId, 'order_pos_confirmed', {
             order_id: orderId, salesorder_id: result.salesorder_id || null
           });
