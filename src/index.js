@@ -370,6 +370,11 @@ function requireMethod(request, env, method) {
   return json(request, env, { ok: false, error: 'Method not allowed', code: 'method_not_allowed' }, 405, { Allow: method });
 }
 
+async function hashSecret(value) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(value || '')));
+  return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 async function secureEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
   const enc = new TextEncoder();
@@ -503,7 +508,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
 
 // ===== BLOCK 3/10: D1 schema bootstrap and safe data helpers =====
 const SCHEMA_STATEMENTS = [
-  'CREATE TABLE IF NOT EXISTS `tenants` (`tenant_id` TEXT NOT NULL PRIMARY KEY, `name` TEXT, `timezone` TEXT, `created_at` TEXT)',
+  'CREATE TABLE IF NOT EXISTS `tenants` (`tenant_id` TEXT NOT NULL PRIMARY KEY, `name` TEXT, `timezone` TEXT, `status` TEXT NOT NULL DEFAULT \'active\', `suspended_reason` TEXT, `dashboard_token_hash` TEXT, `dashboard_token_created_at` TEXT, `created_at` TEXT, `updated_at` TEXT)',
   'CREATE TABLE IF NOT EXISTS `business_settings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `setting_key` TEXT, `setting_value` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `audit_log` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `event` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `integration_status` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `provider` TEXT, `status` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
@@ -547,6 +552,8 @@ async function ensureSchema(env) {
       "ALTER TABLE `tenants` ADD COLUMN `status` TEXT NOT NULL DEFAULT 'active'",
       'ALTER TABLE `tenants` ADD COLUMN `suspended_reason` TEXT',
       'ALTER TABLE `tenants` ADD COLUMN `updated_at` TEXT',
+      'ALTER TABLE `tenants` ADD COLUMN `dashboard_token_hash` TEXT',
+      'ALTER TABLE `tenants` ADD COLUMN `dashboard_token_created_at` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `delivery_address` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `tool_call_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `related_order_id` TEXT',
@@ -2970,6 +2977,20 @@ async function handleVapiEvents(request, env, tenantId) {
   return json(request, env, { ok: true, usage, manager_status: managerResult });
 }
 
+async function authenticateClientDashboard(request, env) {
+  await ensureSchema(env);
+  const token = bearerOrHeader(request, ['x-client-dashboard-token']);
+  if (!token) throw new AppError('Client dashboard token is required.', 'client_dashboard_auth_required', 401);
+  const digest = await hashSecret(token);
+  const tenant = await env.DB.prepare(
+    'SELECT `tenant_id`, `status` FROM `tenants` WHERE `dashboard_token_hash` = ? LIMIT 1'
+  ).bind(digest).first();
+  if (!tenant) throw new AppError('Invalid client dashboard token.', 'unauthorized', 401);
+  const tenantId = validateTenant(tenant.tenant_id);
+  await ensureTenantActive(env, tenantId);
+  return tenantId;
+}
+
 async function requireManagerDashboardAuth(request, env) {
   const expected = envValue(env, ENV_KEYS.managerDashboardToken);
   if (!expected) throw new AppError('MANAGER_DASHBOARD_TOKEN is not configured.', 'manager_dashboard_auth_unconfigured', 503);
@@ -3005,7 +3026,14 @@ async function collectManagerData(env, tenantId) {
     data[table] = result.results || [];
     recordCount += data[table].length;
   }
-  return { ok: true, tenant_id: tenantId, retention_days: RETENTION_DAYS, retained_since: cutoff, exported_at: nowIso(), record_count: recordCount, data };
+  const usage = await env.DB.prepare('SELECT `month`, `total_minutes`, `last_call_at`, `status`, `updated_at` FROM `monthly_call_usage` WHERE `tenant_id` = ? ORDER BY `month` DESC LIMIT 24').bind(tenantId).all();
+  const invoices = await env.DB.prepare('SELECT `invoice_id`, `billing_month`, `minutes`, `amount_due`, `amount_paid`, `status`, `due_at`, `created_at` FROM `invoices` WHERE `tenant_id` = ? ORDER BY `billing_month` DESC LIMIT 24').bind(tenantId).all();
+  const payments = await env.DB.prepare('SELECT `payment_id`, `amount`, `currency`, `method`, `reference`, `created_at` FROM `manual_payments` WHERE `tenant_id` = ? ORDER BY `created_at` DESC LIMIT 50').bind(tenantId).all();
+  const local = zonedParts(new Date(), TIME_ZONE_DEFAULT);
+  const currentMonth = local.year + '-' + String(local.month).padStart(2, '0');
+  const currentUsage = (usage.results || []).find(row => row.month === currentMonth) || { month: currentMonth, total_minutes: 0, status: 'active' };
+  return { ok: true, tenant_id: tenantId, retention_days: RETENTION_DAYS, retained_since: cutoff, exported_at: nowIso(), record_count: recordCount, data,
+    billing: { current_month: currentUsage, monthly_history: usage.results || [], invoices: invoices.results || [], payments: payments.results || [] } };
 }
 
 function routePath(url) {
@@ -3028,6 +3056,33 @@ async function handleAdmin(request, env, url, path) {
   }
   const tenantId = adminTenant(request, url, body);
 
+  if (path === '/admin/issue-client-token') {
+    const tenantId = adminTenant(request, url, body);
+    await ensureSchema(env);
+    const tenantName = clean(body.name || tenantId, 120);
+    const tenantTimeZone = clean(body.timezone || TIME_ZONE_DEFAULT, 64);
+    const token = 'APC_' + makeId(48);
+    const digest = await hashSecret(token);
+    await env.DB.prepare(
+      "INSERT INTO `tenants` (`tenant_id`, `name`, `timezone`, `status`, `dashboard_token_hash`, `dashboard_token_created_at`, `created_at`, `updated_at`) VALUES (?, ?, ?, 'active', ?, ?, ?, ?) ON CONFLICT(`tenant_id`) DO UPDATE SET `name` = excluded.`name`, `timezone` = excluded.`timezone`, `dashboard_token_hash` = excluded.`dashboard_token_hash`, `dashboard_token_created_at` = excluded.`dashboard_token_created_at`, `updated_at` = excluded.`updated_at`"
+    ).bind(tenantId, tenantName, tenantTimeZone, digest, nowIso(), nowIso(), nowIso()).run();
+    await audit(env, tenantId, 'client_dashboard_token_issued', { issued_at: nowIso() });
+    return json(request, env, {
+      ok: true, tenant_id: tenantId, token,
+      warning: 'Copy this client token now. It is shown once; only its SHA-256 hash is stored in D1.',
+      dashboard_data_endpoint: '/client/data',
+      dashboard_export_endpoint: '/client/export'
+    });
+  }
+  if (path === '/admin/revoke-client-token') {
+    const tenantId = adminTenant(request, url, body);
+    await ensureSchema(env);
+    await env.DB.prepare(
+      'UPDATE `tenants` SET `dashboard_token_hash` = NULL, `dashboard_token_created_at` = NULL, `updated_at` = ? WHERE `tenant_id` = ?'
+    ).bind(nowIso(), tenantId).run();
+    await audit(env, tenantId, 'client_dashboard_token_revoked', {});
+    return json(request, env, { ok: true, tenant_id: tenantId, token_revoked: true });
+  }
   if (path === '/admin/bootstrap') {
     const schema = await ensureSchema(env);
     await audit(env, tenantId, 'schema_bootstrap', schema);
@@ -3168,10 +3223,21 @@ async function handleFetch(request, env, ctx) {
     if (path === '/manager' && request.method === 'GET') {
       return new Response(managerDashboardHtml(), { status: 200, headers: { ...responseHeaders(request, env), 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'" } });
     }
+    if (path === '/client/data' || path === '/client/export') {
+      if (request.method !== 'GET') return json(request, env, { ok: false, error: 'Method not allowed', code: 'method_not_allowed' }, 405, { Allow: 'GET' });
+      const tenantId = await authenticateClientDashboard(request, env);
+      const result = await collectManagerData(env, tenantId);
+      if (path === '/client/export') {
+        return new Response(JSON.stringify(result, null, 2), { status: 200, headers: { ...responseHeaders(request, env), 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="${tenantId}-dashboard-export.json"` } });
+      }
+      return json(request, env, result);
+    }
+
     if (path === '/manager/data' || path === '/manager/export') {
       if (request.method !== 'GET') return json(request, env, { ok: false, error: 'Method not allowed', code: 'method_not_allowed' }, 405, { Allow: 'GET' });
       await requireManagerDashboardAuth(request, env);
-      const tenantId = validateTenant(url.searchParams.get('tenant_id'));
+      const tenantId = validateTenant(url.searchParams.get('tenant_id') || DEFAULT_TENANT);
+      if (tenantId !== DEFAULT_TENANT) throw new AppError('Provider-wide access is not available through the restaurant manager token. Use the provider admin API or the tenant client token.', 'tenant_scope_forbidden', 403);
       await ensureTenantActive(env, tenantId);
       const result = await collectManagerData(env, tenantId);
       if (path === '/manager/export') {
