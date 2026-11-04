@@ -25,5 +25,10 @@ binding = "NOTIFICATION_WORKFLOW"
 name = "alex-pizza-notification-delivery"
 class_name = "NotificationDeliveryWorkflow"
 
+[[workflows]]
+binding = "BOOKING_CALENDAR_WORKFLOW"
+name = "alex-pizza-booking-calendar-sync"
+class_name = "BookingCalendarWorkflow"
+
 [triggers]
 crons = ["17 10 * * *"]
