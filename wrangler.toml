@@ -20,5 +20,10 @@ binding = "CALL_USAGE_WORKFLOW"
 name = "alex-pizza-live-call-usage"
 class_name = "CallUsageWorkflow"
 
+[[workflows]]
+binding = "NOTIFICATION_WORKFLOW"
+name = "alex-pizza-notification-delivery"
+class_name = "NotificationDeliveryWorkflow"
+
 [triggers]
 crons = ["17 10 * * *"]
