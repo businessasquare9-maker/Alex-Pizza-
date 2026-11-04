@@ -2196,7 +2196,18 @@ async function requestOrderChange(env, tenantId, args) {
         'CUSTOMER-APPROVED ADDITION added to existing bill ' + orderId + '. Revised total: ' + money(newTotal),
         'order_addition_applied');
     } catch {}
-    return { ok: true, additions_applied: true, original_order_unchanged: false,
+    let updatedReceipt = { status: 'not_sent' };
+    try {
+      updatedReceipt = await dispatchOrderReceipt(env, tenantId, {
+        order_id: orderId, customer_name: original.customer_name || 'Guest', customerPhone: phone,
+        order_type: original.order_type || 'pickup', currency: original.currency || CURRENCY,
+        total: newTotal, items: combinedItems, notes: original.notes || '',
+        related_order_id: original.related_order_id || null
+      }, phone);
+    } catch (err) {
+      updatedReceipt = { status: 'dispatch_error', error: clean(publicError(err).error, 160) };
+    }
+    return { ok: true, additions_applied: true, updated_receipt: updatedReceipt, original_order_unchanged: false,
       order_id: orderId, total: newTotal, currency: CURRENCY, item_count: combinedItems.length,
       status: 'additions_applied_to_original_bill',
       message_for_assistant: 'The additional items were added to the original bill. Cancellation is not allowed after the first 5 minutes. Do not claim the Zoho POS or kitchen ticket was automatically amended; the manager has been notified.' };
@@ -2832,13 +2843,27 @@ async function suspendOverdueInvoiceTenants(env) {
   return { checked: (overdue.results || []).length, suspended };
 }
 
+async function archivePriorMonthlyUsage(env) {
+  await ensureSchema(env);
+  const local = zonedParts(new Date(), TIME_ZONE_DEFAULT);
+  const currentMonth = local.year + '-' + String(local.month).padStart(2, '0');
+  if (local.day !== 1) return { archived: 0, current_month: currentMonth, skipped: true };
+  const result = await env.DB.prepare(
+    "UPDATE `monthly_call_usage` SET `status` = 'archived', `updated_at` = ? WHERE `month` < ? AND LOWER(COALESCE(`status`, '')) != 'archived'"
+  ).bind(nowIso(), currentMonth).run();
+  return { archived: Number(result.meta?.changes || 0), current_month: currentMonth, skipped: false };
+}
+
 async function handleScheduled(env) {
   try {
     await ensureSchema(env);
     const purge = await run60DayDataPurge(env);
+    const monthlyArchive = await archivePriorMonthlyUsage(env);
     const overdueInvoices = await suspendOverdueInvoiceTenants(env);
-    await audit(env, DEFAULT_TENANT, 'scheduled_maintenance', { purgedRecords: purge.purgedRecords, overdueInvoices });
-    return { ...purge, overdueInvoices };
+    await audit(env, DEFAULT_TENANT, 'scheduled_maintenance', {
+      purgedRecords: purge.purgedRecords, monthlyArchive, overdueInvoices
+    });
+    return { ...purge, monthlyArchive, overdueInvoices };
   } catch (err) {
     safeLog(err);
     return { ok: false, ...publicError(err) };
