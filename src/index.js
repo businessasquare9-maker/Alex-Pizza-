@@ -1394,16 +1394,27 @@ async function recordCallMinuteTick(env, tenantId, callId, minuteIndex, countedA
   if (Number.isNaN(at.getTime())) throw new AppError('Invalid call usage tick time.', 'invalid_call_timestamp', 400);
   const monthKey = localDateForTimeZone(at, TIME_ZONE_DEFAULT).slice(0, 7);
   const tickId = callId + ':' + String(minuteIndex);
-  const inserted = await env.DB.prepare(
-    'INSERT OR IGNORE INTO `call_usage_ticks` (`tenant_id`, `id`, `call_id`, `minute_index`, `month`, `counted_at`, `created_at`) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(tenantId, tickId, callId, minuteIndex, monthKey, at.toISOString(), nowIso()).run();
-  if (Number(inserted.meta?.changes || 0) !== 1) return { counted: false, month: monthKey };
-  const monthlyTotal = await addMonthlyUsageMinute(env, tenantId, monthKey, at.toISOString());
-  await env.DB.prepare(
-    'UPDATE `calls` SET `billable_minutes` = MAX(COALESCE(`billable_minutes`, 0), ?) WHERE `tenant_id` = ? AND `call_id` = ?'
-  ).bind(minuteIndex, tenantId, callId).run();
-  return { counted: true, month: monthKey, monthlyTotal };
+  // Ledger insert, monthly increment and call counter update commit as one D1 transaction.
+  // SQLite changes() ensures a duplicate webhook/workflow tick never adds a second minute.
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      'INSERT OR IGNORE INTO `call_usage_ticks` (`tenant_id`, `id`, `call_id`, `minute_index`, `month`, `counted_at`, `created_at`) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(tenantId, tickId, callId, minuteIndex, monthKey, at.toISOString(), nowIso()),
+    env.DB.prepare(
+      "INSERT INTO `monthly_call_usage` (`tenant_id`, `month`, `total_minutes`, `last_call_at`, `status`, `updated_at`) SELECT ?, ?, 1, ?, 'active', ? WHERE changes() = 1 ON CONFLICT(`tenant_id`, `month`) DO UPDATE SET `total_minutes` = `monthly_call_usage`.`total_minutes` + 1, `last_call_at` = excluded.`last_call_at`, `status` = 'active', `updated_at` = excluded.`updated_at`"
+    ).bind(tenantId, monthKey, at.toISOString(), nowIso()),
+    env.DB.prepare(
+      'UPDATE `calls` SET `billable_minutes` = MAX(COALESCE(`billable_minutes`, 0), ?) WHERE `tenant_id` = ? AND `call_id` = ? AND changes() = 1'
+    ).bind(minuteIndex, tenantId, callId)
+  ]);
+  const inserted = Number(results?.[0]?.meta?.changes || 0) === 1;
+  if (!inserted) return { counted: false, month: monthKey };
+  const row = await env.DB.prepare(
+    'SELECT `total_minutes` FROM `monthly_call_usage` WHERE `tenant_id` = ? AND `month` = ? LIMIT 1'
+  ).bind(tenantId, monthKey).first();
+  return { counted: true, month: monthKey, monthlyTotal: Number(row?.total_minutes || 0) };
 }
+
 async function recordCallMinutes(env, tenantId, durationSeconds, endedAt, callId = '') {
   await ensureSchema(env);
   const seconds = Math.max(1, Math.min(86400, Number(durationSeconds) || DEFAULT_CALL_SECONDS));
