@@ -38,7 +38,7 @@ const SLOT_DEFAULT_MINUTES = 90;
 
 const ALLOWED_TABLES = new Set([
   'tenants', 'audit_log', 'bookings', 'business_settings', 'calls',
-  'integration_status', 'manager_tasks', 'menu_items', 'notifications',
+  'integration_status', 'manager_tasks', 'manager_status_checks', 'menu_items', 'notifications',
   'order_change_requests', 'order_items', 'orders', 'zoho_oauth_tokens',
   'monthly_call_usage', 'manual_payments', 'invoices'
 ]);
@@ -87,7 +87,10 @@ const ENV_KEYS = {
   callerSalt: ['CALLER_HASH_SALT', 'TOOL_SHARED_SECRET', 'ADMIN_API_TOKEN'],
   storeRawPhone: ['STORE_RAW_CALLER_PHONE'],
   requireCustomerPhone: ['REQUIRE_CUSTOMER_PHONE'],
-  allowManualTotal: ['ALLOW_MANUAL_TOTAL']
+  allowManualTotal: ['ALLOW_MANUAL_TOTAL'],
+  vapiApiKey: ['VAPI_PRIVATE_API_KEY', 'VAPI_API_KEY', 'VAPI_TOKEN'],
+  vapiAssistantId: ['VAPI_MANAGER_ASSISTANT_ID', 'VAPI_ASSISTANT_ID'],
+  vapiPhoneNumberId: ['VAPI_PHONE_NUMBER_ID']
 };
 
 const PHONE_KEY_HINT = /phone|whatsapp|mobile|sms|number|contact|recipient|msisdn|e164/i;
@@ -96,7 +99,7 @@ const BUSINESS_HINT = /business|store|restaurant|shop|sender|from|signalwire|twi
 const GENERIC_HINT = /^(phone|phone_number|contact_number|whatsapp_number|hotline|support_phone)$/i;
 
 const PURGE_TABLES = [
-  'audit_log', 'bookings', 'calls', 'notifications', 'manager_tasks',
+  'audit_log', 'bookings', 'calls', 'notifications', 'manager_tasks', 'manager_status_checks',
   'order_change_requests', 'order_items', 'orders'
 ];
 
@@ -506,8 +509,9 @@ const SCHEMA_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS `integration_status` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `provider` TEXT, `status` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `menu_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `sku` TEXT, `name` TEXT NOT NULL, `category` TEXT, `size` TEXT, `flavor` TEXT, `price_cents` INTEGER NOT NULL DEFAULT 0, `price` REAL, `active` INTEGER NOT NULL DEFAULT 1, `pos_variant_id` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `bookings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `booking_time` TEXT NOT NULL, `duration_minutes` INTEGER NOT NULL DEFAULT 90, `party_size` INTEGER, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `status` TEXT, `started_at` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_tasks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `task_id` TEXT, `title` TEXT, `description` TEXT, `priority` TEXT, `status` TEXT, `caller_hash` TEXT, `dedupe_key` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `manager_status_checks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_reference` TEXT NOT NULL, `customer_phone` TEXT, `caller_hash` TEXT, `manager_phone` TEXT, `inbound_call_id` TEXT, `outbound_call_id` TEXT, `status` TEXT, `manager_response` TEXT, `started_at` TEXT, `completed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `notifications` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `notification_id` TEXT, `recipient_phone` TEXT, `sender_phone` TEXT, `message` TEXT, `notification_type` TEXT, `channel` TEXT, `status` TEXT, `provider_message_id` TEXT, `metadata` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `orders` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `order_type` TEXT, `total` REAL NOT NULL DEFAULT 0, `currency` TEXT, `items_json` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `order_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `sku` TEXT, `name` TEXT, `category` TEXT, `unit_price` REAL NOT NULL DEFAULT 0, `quantity` INTEGER NOT NULL DEFAULT 1, `line_total` REAL NOT NULL DEFAULT 0, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
@@ -554,7 +558,9 @@ async function ensureSchema(env) {
       'ALTER TABLE `invoices` ADD COLUMN `due_at` TEXT',
       'ALTER TABLE `calls` ADD COLUMN `duration_seconds` INTEGER',
       'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER',
-      'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT'
+      'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT',
+      'ALTER TABLE `calls` ADD COLUMN `started_at` TEXT',
+      'ALTER TABLE `calls` ADD COLUMN `status` TEXT'
     ]) { try { await env.DB.prepare(migration).run(); } catch {} }
     // Preserve legacy dollar-denominated menu prices when adding the cents column.
     try {
@@ -563,6 +569,8 @@ async function ensureSchema(env) {
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tool_call` ON `orders` (`tenant_id`, `tool_call_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tenant_order_id` ON `orders` (`tenant_id`, `order_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_calls_tenant_call_id` ON `calls` (`tenant_id`, `call_id`)').run(); } catch {}
+    try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS `idx_manager_status_order` ON `manager_status_checks` (`tenant_id`, `order_reference`, `created_at`)').run(); } catch {}
+    try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_manager_status_outbound_call` ON `manager_status_checks` (`tenant_id`, `outbound_call_id`)').run(); } catch {}
     columnCache.clear();
     return { tablesChecked };
   })();
@@ -1228,7 +1236,7 @@ async function hasRecentRepeatTask(env, tenantId, dedupeKey, since) {
   ).bind(...params).first();
   return Boolean(row);
 }
-async function detectRepeatCaller(env, tenantId, customerPhone, purpose = 'Order / support query') {
+async function detectRepeatCaller(env, tenantId, customerPhone, purpose = 'Order / support query', existingCallId = '') {
   await ensureSchema(env);
   const normalizedPhone = normalizePhone(customerPhone);
   const callerRef = await callerFingerprint(env, normalizedPhone);
@@ -1255,21 +1263,34 @@ async function detectRepeatCaller(env, tenantId, customerPhone, purpose = 'Order
   if (!idConditions.length) where.push('1 = 0');
   else where.push('(' + idConditions.join(' OR ') + ')');
 
+  if (existingCallId) {
+    const currentCallColumn = findColumn(columns, ['call_id']);
+    if (currentCallColumn) {
+      where.push(`${q(currentCallColumn)} != ?`);
+      params.push(existingCallId);
+    }
+  }
   const recent = await env.DB.prepare(
     `SELECT * FROM ${q('calls')} WHERE ${where.join(' AND ')} LIMIT 100`
   ).bind(...params).all();
   const priorCount = (recent.results || []).length;
 
-  const callId = 'CALL-' + makeId(8);
-  await insertScoped(env, 'calls', tenantId, [
-    [['id'], callId],
-    [['call_id'], callId],
-    [['customer_phone', 'phone', 'caller_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? (normalizedPhone || null) : null],
-    [['caller_hash'], callerRef],
-    [['purpose', 'reason'], clean(purpose, 250)],
-    [['direction'], 'inbound'],
-    [['created_at'], nowIso()]
-  ]);
+  let currentCallExists = false;
+  if (existingCallId) {
+    const current = await env.DB.prepare(
+      'SELECT 1 FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+    ).bind(tenantId, existingCallId).first();
+    currentCallExists = Boolean(current);
+  }
+  if (!currentCallExists) {
+    const callId = existingCallId || ('CALL-' + makeId(8));
+    await insertScoped(env, 'calls', tenantId, [
+      [['id'], callId], [['call_id'], callId],
+      [['customer_phone', 'phone', 'caller_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? (normalizedPhone || null) : null],
+      [['caller_hash'], callerRef], [['purpose', 'reason'], clean(purpose, 250)],
+      [['direction'], 'inbound'], [['status'], 'in_progress'], [['started_at'], nowIso()], [['created_at'], nowIso()]
+    ]);
+  }
 
   if (priorCount < 1) return { flagged: false, callCount: 1, callerRef };
 
@@ -2005,7 +2026,7 @@ async function submitOrder(env, tenantId, args, ctx) {
     if (existing) return { ok: true, order_id: existing.order_id, status: existing.status, total: Number(existing.total || 0), currency: existing.currency || CURRENCY, idempotent_replay: true, zoho_pos: 'status_from_existing_order' };
   }
   const callerRef = await callerFingerprint(env, customerPhone);
-  const repeat = await detectRepeatCaller(env, tenantId, customerPhone, args.call_purpose || 'New order submission');
+  const repeat = await detectRepeatCaller(env, tenantId, customerPhone, args.call_purpose || 'New order submission', clean(args.__call_id || '', 120));
   const order = await createOrderRecord(env, tenantId, args, pricedItems, callerRef, customerPhone);
   await updateOrderStatus(env, tenantId, order.order_id, 'pending_pos_sync');
   let receiptDispatch = { status: 'not_dispatched', reason: 'receipt_dispatch_not_attempted' };
@@ -2483,7 +2504,7 @@ const TOOL_HANDLERS = {
   },
   async flag_repeat_caller(env, tenantId, args) {
     const phone = customerPhoneFrom(args, true);
-    return { ok: true, ...(await detectRepeatCaller(env, tenantId, phone, args.purpose || 'Caller requested assistance')) };
+    return { ok: true, ...(await detectRepeatCaller(env, tenantId, phone, args.purpose || 'Caller requested assistance', clean(args.__call_id || '', 120))) };
   },
   async send_booking_notifications(env, tenantId, args) {
     return await sendBookingNotifications(env, tenantId, args);
@@ -2554,6 +2575,7 @@ async function executeToolCall(env, tenantId, call, index, ctx) {
     }
     const args = getToolArgs(call);
     args.__tool_call_id = (call?.toolCallId || call?.id || call?.callId) ? callId : '';
+    args.__call_id = clean(ctx?.callId || '', 120);
     const payload = await handler(env, tenantId, args, ctx);
     return toolResult(callId, payload);
   } catch (err) {
@@ -2580,9 +2602,17 @@ async function handleVapiTools(request, env, ctx, tenantId) {
   await ensureTenantActive(env, tenantId);
   const body = await readJson(request, env);
   const calls = extractToolCalls(body);
+  const vapiCall = body?.message?.call || body?.call || {};
+  const callContext = {
+    callId: clean(vapiCall.id || '', 120),
+    phoneNumberId: clean(vapiCall.phoneNumberId || vapiCall.phoneNumber?.id || '', 120),
+    controlUrl: clean(vapiCall.monitor?.controlUrl || '', 1000),
+    customerPhone: normalizePhone(vapiCall.customer?.number || vapiCall.customer?.phone || ''),
+    callType: clean(vapiCall.type || '', 40)
+  };
   const results = [];
   for (let i = 0; i < calls.length; i++) {
-    results.push(await executeToolCall(env, tenantId, calls[i], i, ctx));
+    results.push(await executeToolCall(env, tenantId, calls[i], i, callContext));
   }
   return json(request, env, { results, tool_count: results.length, tenant_id: tenantId });
 }
