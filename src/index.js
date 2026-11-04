@@ -3667,6 +3667,24 @@ async function configureVapiAssistantEvents(env, tenantId, requestOrigin) {
     const result = await syncAndReplaceD1Menu(env, tenantId);
     return json(request, env, { ok: true, result });
   }
+  if (path === '/admin/zoho-item-map-preview') {
+    const report = await buildZohoMenuMappingReport(env, tenantId);
+    await audit(env, tenantId, 'zoho_item_mapping_previewed', {
+      local_menu_count: report.local_menu_count, exact_matches: report.exact_matches, needs_attention: report.needs_attention
+    });
+    return json(request, env, { ok: true, ...report });
+  }
+  if (path === '/admin/zoho-item-map-apply') {
+    const report = await buildZohoMenuMappingReport(env, tenantId);
+    const applied = await applyZohoMenuMapping(env, tenantId, report);
+    await audit(env, tenantId, 'zoho_item_mapping_auto_applied', {
+      applied_now: applied.applied_now, exact_matches: applied.exact_matches, needs_attention: applied.needs_attention
+    });
+    return json(request, env, {
+      ok: true, ...applied,
+      rule: 'Only unique active Zoho SKU matches with exact price_cents were written. Existing conflicting IDs, duplicates and price mismatches were not changed.'
+    });
+  }
   if (path === '/admin/map-menu-pos-items') {
     await ensureSchema(env);
     if (!Array.isArray(body.items) || !body.items.length || body.items.length > MAX_MENU_ROWS) {
@@ -3818,9 +3836,9 @@ async function handleFetch(request, env, ctx) {
           envValue(env, ENV_KEYS.zohoClientSecret) &&
           envValue(env, ENV_KEYS.zohoRefreshToken) &&
           envValue(env, ENV_KEYS.zohoOrganization) &&
-          envValue(env, ENV_KEYS.zohoCustomer) &&
-          envValue(env, ENV_KEYS.zohoItemIdMap)
+          envValue(env, ENV_KEYS.zohoCustomer)
         ),
+        zoho_item_id_map_env_configured: Boolean(envValue(env, ENV_KEYS.zohoItemIdMap)),
         google_calendar_configured: googleCalendarState(env).configured,
         google_calendar_partially_configured: googleCalendarState(env).partially_configured,
         notification_webhook_configured: Boolean(envValue(env, ENV_KEYS.webhookUrl))
