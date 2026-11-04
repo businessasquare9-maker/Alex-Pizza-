@@ -1000,7 +1000,7 @@ async function createGoogleCalendarBooking(env, tenantId, booking) {
     ].filter(Boolean).join('\n'),
     start: { dateTime: start.toISOString(), timeZone: TIME_ZONE_DEFAULT },
     end: { dateTime: end.toISOString(), timeZone: TIME_ZONE_DEFAULT },
-    extendedProperties: { private: { booking_id: booking.booking_id, tenant_id: tenantId } }
+    extendedProperties: { private: { booking_id: booking.booking_id, tenant_id: tenantId, party_size: String(booking.party_size) } }
   };
   const data = await googleCalendarRequest(env, googleCalendarUrl(env), {
     method: 'POST',
@@ -1074,24 +1074,33 @@ async function checkAvailability(env, tenantId, bookingTime, durationMinutes, re
   const occupiedTablesLocal = occupiedRows.reduce((sum, row) => sum + Math.ceil(Math.max(1, Number(row.party_size || row.guests || 1)) / 4), 0);
   const localBookingIds = new Set(occupiedRows.map(row => clean(row.booking_id || row.id || '', 100)).filter(Boolean));
   let externalCalendarBookings = 0;
+  let externalCalendarSeats = 0;
+  let externalCalendarTables = 0;
   const calendarEvents = await listGoogleCalendarEvents(env, new Date(start - config.maxMinutes * 60000), new Date(end));
   if (calendarEvents) {
-    externalCalendarBookings = calendarEvents.filter(event => {
+    const externalEvents = calendarEvents.filter(event => {
       if (!eventOverlapsRange(event, start, end)) return false;
       const linkedBookingId = clean(event?.extendedProperties?.private?.booking_id || '', 100);
       return !linkedBookingId || !localBookingIds.has(linkedBookingId);
-    }).length;
+    });
+    externalCalendarBookings = externalEvents.length;
+    for (const event of externalEvents) {
+      const guests = Math.max(1, Math.min(40, Math.floor(Number(event?.extendedProperties?.private?.party_size) || 4)));
+      externalCalendarSeats += guests;
+      externalCalendarTables += Math.ceil(guests / 4);
+    }
   }
-  const occupiedTables = occupiedTablesLocal + externalCalendarBookings;
-  const seatsRemaining = Math.max(0, 40 - occupiedSeats - externalCalendarBookings * 4);
-  if (occupiedTables + tablesNeeded > config.maxTables || occupiedSeats + partySize + externalCalendarBookings * 4 > 40) {
+  const occupiedTables = occupiedTablesLocal + externalCalendarTables;
+  const seatsRemaining = Math.max(0, 40 - occupiedSeats - externalCalendarSeats);
+  if (occupiedTables + tablesNeeded > config.maxTables || occupiedSeats + partySize + externalCalendarSeats > 40) {
     return {
       available: false,
       reason: 'There is not enough table or seat capacity for a party of ' + partySize + '. Alex Pizza has 10 tables and 40 seats.',
       tables_occupied: occupiedTables,
       tables_needed: tablesNeeded,
-      seats_occupied: occupiedSeats + externalCalendarBookings * 4,
-      seats_remaining: seatsRemaining
+      seats_occupied: occupiedSeats + externalCalendarSeats,
+      seats_remaining: seatsRemaining,
+      external_calendar_bookings: externalCalendarBookings
     };
   }
   const occupied = occupiedTables;
@@ -1104,6 +1113,8 @@ async function checkAvailability(env, tenantId, bookingTime, durationMinutes, re
     seats_remaining: Math.max(0, 40 - occupiedSeats - externalCalendarBookings * 4 - partySize),
     tables_needed: tablesNeeded,
     max_tables: config.maxTables,
+    external_calendar_bookings: externalCalendarBookings,
+    external_calendar_seats: externalCalendarSeats,
     hours: businessHoursMessage(config)
   };
 }
@@ -1145,14 +1156,16 @@ async function insertBookingWithinCapacity(env, tenantId, booking) {
   if (statusColumn) overlap.push(`LOWER(COALESCE(${q(statusColumn)}, '')) NOT IN ('cancelled', 'canceled', 'rejected', 'no_show')`);
   const overlapSql = overlap.join(' AND ');
   const sql = `INSERT INTO ${q('bookings')} (${keys.map(q).join(', ')}) SELECT ${keys.map(() => '?').join(', ')} WHERE ` +
-    `(COALESCE((SELECT SUM(${partyValue}) FROM ${q('bookings')} WHERE ${overlapSql}), 0) + ?) <= 40 AND ` +
-    `(COALESCE((SELECT SUM(${tablesValue}) FROM ${q('bookings')} WHERE ${overlapSql}), 0) + ?) <= ?`;
+    `(COALESCE((SELECT SUM(${partyValue}) FROM ${q('bookings')} WHERE ${overlapSql}), 0) + ? + ?) <= 40 AND ` +
+    `(COALESCE((SELECT SUM(${tablesValue}) FROM ${q('bookings')} WHERE ${overlapSql}), 0) + ? + ?) <= ?`;
   const start = new Date(booking.bookingTime).toISOString();
   const end = new Date(new Date(start).getTime() + booking.durationMinutes * 60000).toISOString();
+  const externalSeats = Math.max(0, Math.min(40, Number(booking.externalCalendarSeats) || 0));
+  const externalTables = Math.max(0, Math.min(10, Number(booking.externalCalendarTables) || 0));
   const params = [
     ...keys.map(key => data[key]),
-    tenantId, end, start, booking.partySize,
-    tenantId, end, start, booking.partySize, booking.maxTables
+    tenantId, end, start, externalSeats, booking.partySize,
+    tenantId, end, start, externalTables, booking.partySize, booking.maxTables
   ];
   const result = await env.DB.prepare(sql).bind(...params).run();
   return Number(result.meta?.changes || 0) === 1;
@@ -1181,7 +1194,9 @@ async function createBooking(env, tenantId, args) {
     status: bookingStatusInitial,
     notes: clean(args.notes || '', 1000),
     createdAt: bookingCreatedAt,
-    maxTables: businessConfig(env).maxTables
+    maxTables: businessConfig(env).maxTables,
+    externalCalendarSeats: availability.external_calendar_seats,
+    externalCalendarTables: availability.tables_occupied - Math.max(0, availability.tables_occupied - (availability.external_calendar_bookings || 0))
   });
   if (!inserted) {
     return { ok: false, code: 'booking_unavailable', available: false, reason: 'Another reservation was confirmed for this time. Please choose another time.' };
