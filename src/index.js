@@ -2870,29 +2870,74 @@ async function handleVapiEvents(request, env, tenantId) {
   await ensureTenantActive(env, tenantId);
   const body = await readJson(request, env);
   const message = body?.message && typeof body.message === 'object' ? body.message : body;
-  if (message?.type !== 'end-of-call-report') return json(request, env, { ok: true, ignored: clean(message?.type || 'unknown', 60) });
+  const eventType = clean(message?.type || 'unknown', 60);
   const callId = clean(message?.call?.id || message?.callId || '', 120);
-  if (!callId) return json(request, env, { ok: true, skipped: 'missing_call_id' });
-  let seconds = Number(message.durationSeconds) || (Number(message.durationMs) / 1000) || 0;
-  if (!seconds && message.startedAt && message.endedAt) seconds = (new Date(message.endedAt).getTime() - new Date(message.startedAt).getTime()) / 1000;
-  if (!Number.isFinite(seconds) || seconds <= 0) return json(request, env, { ok: true, skipped: 'no_duration' });
-  if (callId) {
-    const seen = await env.DB.prepare("SELECT 1 AS found FROM `audit_log` WHERE `tenant_id` = ? AND `event` = 'call_minutes' AND `details` LIKE ? LIMIT 1").bind(tenantId, '%' + callId + '%').first();
-    if (seen) return json(request, env, { ok: true, duplicate: true });
+
+  if (eventType === 'status-update') {
+    const status = norm(message?.status || '');
+    if (status === 'in-progress' && callId) {
+      const recorded = await recordInboundCallStart(env, tenantId, message.call || {});
+      return json(request, env, { ok: true, event: eventType, status, ...recorded });
+    }
+    if (status === 'ended' && callId) {
+      await env.DB.prepare(
+        'UPDATE `calls` SET `status` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ?'
+      ).bind('ended', nowIso(), tenantId, callId).run();
+    }
+    return json(request, env, { ok: true, event: eventType, status: status || 'received', call_id: callId || null });
   }
+
+  if (eventType !== 'end-of-call-report') {
+    return json(request, env, { ok: true, ignored: eventType });
+  }
+
+  // The same event endpoint also receives the manager's outbound Vapi status call.
+  const managerResult = await storeManagerCallResult(env, tenantId, message);
+  if (!callId) return json(request, env, { ok: true, skipped: 'missing_call_id', manager_status: managerResult });
+
+  let seconds = Number(message.durationSeconds) || (Number(message.durationMs) / 1000) || 0;
+  if (!seconds && message.startedAt && message.endedAt) {
+    seconds = (new Date(message.endedAt).getTime() - new Date(message.startedAt).getTime()) / 1000;
+  }
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    await env.DB.prepare(
+      'UPDATE `calls` SET `status` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ?'
+    ).bind('ended', message.endedAt || nowIso(), tenantId, callId).run();
+    return json(request, env, { ok: true, skipped: 'no_duration', manager_status: managerResult });
+  }
+
+  const seen = await env.DB.prepare(
+    "SELECT 1 AS found FROM `audit_log` WHERE `tenant_id` = ? AND `event` = 'call_minutes' AND `details` LIKE ? LIMIT 1"
+  ).bind(tenantId, '%' + callId + '%').first();
+  if (seen) return json(request, env, { ok: true, duplicate: true, manager_status: managerResult });
+
   const endedAt = message.endedAt || nowIso();
   const usage = await recordCallMinutes(env, tenantId, seconds, endedAt);
-  if (callId) {
-    const startedAt = message.startedAt || null;
+  const existingCall = await env.DB.prepare(
+    'SELECT 1 FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+  ).bind(tenantId, callId).first();
+  if (existingCall) {
+    await env.DB.prepare(
+      'UPDATE `calls` SET `status` = ?, `duration_seconds` = ?, `billable_minutes` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ?'
+    ).bind('ended', Math.ceil(seconds), Math.ceil(seconds / 60), new Date(endedAt).toISOString(), tenantId, callId).run();
+  } else {
+    const startedAt = message.startedAt || message.call?.createdAt || endedAt;
     await insertScoped(env, 'calls', tenantId, [
-      [['id'], callId], [['call_id'], callId], [['purpose'], 'Vapi end-of-call report'],
+      [['id'], callId], [['call_id'], callId],
+      [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? normalizePhone(message.call?.customer?.number || '') : null],
+      [['caller_hash'], await callerFingerprint(env, message.call?.customer?.number || '')],
+      [['purpose'], 'Vapi end-of-call report'],
       [['direction'], clean(message.call?.type || 'unknown', 30)],
+      [['status'], 'ended'], [['started_at'], new Date(startedAt).toISOString()],
       [['duration_seconds'], Math.ceil(seconds)], [['billable_minutes'], Math.ceil(seconds / 60)],
-      [['ended_at'], new Date(endedAt).toISOString()], [['created_at'], startedAt || new Date(endedAt).toISOString()]
+      [['ended_at'], new Date(endedAt).toISOString()], [['created_at'], new Date(startedAt).toISOString()]
     ]);
   }
-  await audit(env, tenantId, 'call_minutes', { call_id: callId, duration_seconds: Math.ceil(seconds), ...usage });
-  return json(request, env, { ok: true, usage });
+  await audit(env, tenantId, 'call_minutes', {
+    call_id: callId, duration_seconds: Math.ceil(seconds), ...usage,
+    manager_status_check: Boolean(managerResult?.matched)
+  });
+  return json(request, env, { ok: true, usage, manager_status: managerResult });
 }
 
 async function requireManagerDashboardAuth(request, env) {
