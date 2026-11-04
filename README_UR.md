@@ -83,13 +83,9 @@ D1 `menu_items` اصل menu source of truth ہے۔ Worker ان کالمز کو �
 
 Menu sync destructive نہیں؛ existing rows delete یا reseed نہیں ہوتیں۔ Legacy `price` کو additive migration کے ذریعے `price_cents` میں convert کیا جاتا ہے۔
 
-اگر `pos_variant_id` خالی ہو تو Worker Zoho POS item list سے exact SKU match تلاش کرتا ہے۔ Mapping صرف تب محفوظ ہوتی ہے جب:
-- SKU exact اور unique ہو،
-- Zoho item active/sellable ہو،
-- D1 `price_cents` اور Zoho rate cents برابر ہوں،
-- پہلے سے موجود ID کا conflict نہ ہو۔
+اگر `pos_variant_id` خالی ہو تو Worker Zoho POS item list میں unique exact SKU اور active/sellable item تلاش کرتا ہے۔ Duplicate SKU، disabled item، missing SKU یا پہلے سے موجود conflicting D1 ID کو guess یا overwrite نہیں کیا جاتا۔
 
-Duplicate SKU، disabled item، price difference یا conflicting ID کو خود سے guess نہیں کیا جاتا۔ CSV reconciliation template repository میں شامل ہے۔
+Customer bill کے لیے D1 `price_cents` اصل price ہے۔ اگر Zoho catalog rate مختلف ہو تو mapping report میں `price_override_required` دکھایا جاتا ہے؛ Zoho Sales Order line میں D1 کا approved rate بھیجا جاتا ہے۔ Zoho catalog کی قیمت خود سے تبدیل نہیں ہوتی۔ CSV reconciliation template repository میں شامل ہے۔
 
 Zoho POS OAuth scopes:
 - `ZohoPOSAPI.items.READ`
