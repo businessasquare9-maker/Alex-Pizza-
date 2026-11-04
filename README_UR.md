@@ -11,8 +11,10 @@ Cloudflare Workers Builds میں یہ values استعمال ہوں:
 | GitHub repository | `businessasquare9-maker/Alex-Pizza-` |
 | Production branch | `main` |
 | Root directory | `/` |
-| Build command | `node verify-build.mjs` |
+| Build command (verification کے لیے تجویز کردہ) | `node verify-build.mjs` |
 | Deploy command | `npx wrangler deploy` |
+
+اس JavaScript Worker کے لیے Build command optional ہے۔ اگر Cloudflare Dashboard میں یہ ابھی blank ہے تو Workers Builds پھر بھی ہر `main` push پر Deploy command چلاتی ہے، لیکن pre-deploy verification script نہیں چلتی۔ اسے بھی خودکار کرنے کے لیے **Settings → Builds** میں Build command `node verify-build.mjs` رکھیں۔
 | Worker | `calling-agent-api` |
 
 جب GitHub کی `main` branch میں commit push ہوتا ہے تو منسلک Workers Builds production pipeline شروع کرتی ہے۔ Git commit SHA اور Cloudflare Deployment ID الگ چیزیں ہیں۔ اصل Active Deployment اور build logs Cloudflare Worker کے Deployments / build history میں ہوتے ہیں۔
