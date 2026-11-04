@@ -2360,41 +2360,67 @@ async function createManagerTask(env, tenantId, title, description, priority = '
   return { task_id: taskId, status: 'manager_review_required', notification };
 }
 async function requestOrderCancellation(env, tenantId, args) {
+  await ensureSchema(env);
   const orderId = clean(args.order_reference || '', 100);
   const phone = customerPhoneFrom(args, true);
   const reason = clean(args.reason || '', 1000);
-  if (!orderId || !reason) throw new AppError('order_reference, customer_phone and reason are required.', 'cancel_request_incomplete', 400);
-  const status = await getOrderStatus(env, tenantId, { order_reference: orderId, customer_phone: phone });
-  const ageMinutes = Math.max(0, (Date.now() - new Date(status.created_at || Date.now()).getTime()) / 60000);
-  const decision = norm(args.customer_decision || '');
+  if (!orderId || !reason) {
+    throw new AppError('order_reference, customer_phone and reason are required.', 'cancel_request_incomplete', 400);
+  }
+  const verified = await getOrderStatus(env, tenantId, { order_reference: orderId, customer_phone: phone });
+  const ageMinutes = Math.max(0, (Date.now() - new Date(verified.created_at || Date.now()).getTime()) / 60000);
+
   if (ageMinutes <= 5) {
-    const update = await env.DB.prepare("UPDATE `orders` SET `status` = 'cancelled', `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `created_at` >= ? AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')")
-      .bind(nowIso(), tenantId, orderId, orderId, new Date(Date.now() - 5 * 60000).toISOString()).run();
-    if (Number(update.meta?.changes || 0) !== 1) throw new AppError('The 5-minute cancellation window expired while processing. The original order was not changed.', 'cancel_window_expired', 409);
+    const update = await env.DB.prepare(
+      "UPDATE `orders` SET `status` = 'cancelled', `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `created_at` >= ? AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
+    ).bind(nowIso(), tenantId, orderId, orderId, new Date(Date.now() - 5 * 60000).toISOString()).run();
+    if (Number(update.meta?.changes || 0) !== 1) {
+      throw new AppError('The 5-minute cancellation window expired while processing. The original order was not changed.',
+        'cancel_window_expired', 409);
+    }
     await insertScoped(env, 'order_change_requests', tenantId, [
       [['id', 'request_id'], 'CNL-' + makeId(8)], [['order_id'], orderId],
       [['requested_change', 'change', 'message'], 'CANCEL ORDER'], [['reason'], reason],
       [['status'], 'cancelled_within_five_minute_policy'], [['created_at'], nowIso()]
     ]);
-    try { await queueRoleNotification(env, tenantId, 'manager', 'ORDER CANCELLED within the 5-minute customer policy: ' + orderId + '. Check Zoho/kitchen if already received.', 'order_cancelled'); } catch {}
+    try {
+      await queueRoleNotification(env, tenantId, 'manager',
+        'ORDER CANCELLED within the first 5 minutes: ' + orderId + '. Check Zoho/kitchen if already received.',
+        'order_cancelled');
+    } catch {}
     await audit(env, tenantId, 'order_cancelled_within_five_minutes', { order_id: orderId });
-    return { ok: true, cancelled: true, order_reference: orderId, status: 'cancelled_within_policy', message_for_assistant: 'The order has been marked cancelled in the system. If POS already received it, manager has been alerted to stop kitchen processing.' };
+    return {
+      ok: true, cancelled: true, order_reference: orderId, status: 'cancelled_within_policy',
+      message_for_assistant: 'The order was cancelled within the first 5 minutes. The manager was alerted to stop kitchen/POS processing if already started.'
+    };
   }
-  if (decision === 'no') {
-    const task = await createManagerTask(env, tenantId, 'Customer declined a new order after late cancellation request',
-      'Original order ' + orderId + ' remains unchanged. Cancellation reason: ' + reason, 'normal');
-    await insertScoped(env, 'order_change_requests', tenantId, [
-      [['id', 'request_id'], 'CNL-' + makeId(8)], [['order_id'], orderId],
-      [['requested_change', 'change', 'message'], 'CANCEL ORDER'], [['reason'], reason],
-      [['status'], 'customer_declined_new_order_manager_awareness'], [['created_at'], nowIso()]
-    ]);
-    await audit(env, tenantId, 'late_order_cancel_declined', { order_id: orderId, task_id: task.task_id });
-    return { ok: true, cancelled: false, original_order_unchanged: true, new_order_created: false, status: 'manager_awareness_recorded', message_for_assistant: 'Tell the customer the original order remains unchanged. The manager has been notified for awareness; do not transfer the call.' };
-  }
-  if (decision === 'yes') {
-    return { ok: true, cancelled: false, original_order_unchanged: true, new_order_created: false, requires_new_order_submission: true, related_order_reference: orderId, message_for_assistant: 'The customer agreed to a separate new order. Collect the complete new items, read them back and get explicit confirmation, then call submit_order with related_order_reference set to the original order reference and deliver_with_original true. Never cancel or edit the original order.' };
-  }
-  return { ok: true, cancelled: false, original_order_unchanged: true, requires_customer_decision: true, message_for_assistant: 'The 5-minute cancellation window has passed. Do not cancel or modify the original order. Ask whether the customer wants a separate new order delivered together with the original. If yes, collect and confirm the complete new order. If no, call request_order_cancel again with customer_decision no to notify the manager for awareness. Do not transfer the call.' };
+
+  // Cancellation is forbidden after minute five, including the 5–20 minute additions window.
+  const requestId = 'CNL-' + makeId(8);
+  await insertScoped(env, 'order_change_requests', tenantId, [
+    [['id', 'request_id'], requestId], [['order_id'], orderId],
+    [['requested_change', 'change', 'message'], 'CANCEL ORDER'],
+    [['reason'], reason],
+    [['status'], 'cancellation_denied_after_five_minutes_original_order_preserved'],
+    [['created_at'], nowIso()]
+  ]);
+  const task = await createManagerTask(
+    env, tenantId,
+    'Customer requested cancellation after the 5-minute cutoff',
+    'Cancellation was not applied. Original order ' + orderId + ' remains unchanged. Request reason: ' + reason,
+    'high'
+  );
+  await audit(env, tenantId, 'late_order_cancellation_denied', {
+    order_id: orderId, request_id: requestId, order_age_minutes: Math.round(ageMinutes * 100) / 100,
+    manager_task_id: task.task_id
+  });
+  return {
+    ok: true, cancelled: false, original_order_unchanged: true,
+    status: 'cancellation_not_allowed_after_five_minutes',
+    order_reference: orderId,
+    manager_notified: true,
+    message_for_assistant: 'The original order cannot be cancelled after the first 5 minutes. Between 5 and 20 minutes, only additions are allowed. After 20 minutes, the original bill remains locked. Explain this politely; do not create a replacement order from a cancellation request and do not transfer the call.'
+  };
 }
 
 async function transferToManager(env, tenantId, args) {
@@ -2485,7 +2511,7 @@ const TOOL_CATALOG = [
   { name: 'request_manager_status_check', description: 'Verify order reference and customer phone, then request manager status check.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
   { name: 'book_table', description: 'Create a table reservation after checking availability and calendar synchronization.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40 }, booking_time: { type: 'string' }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, duration_minutes: { type: 'integer' } }, required: ['customer_name', 'customer_phone', 'booking_time', 'party_size'], additionalProperties: false } },
   { name: 'check_table_availability', description: 'Check reservation availability in America/New_York business time.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40, description: 'Number of guests; restaurant capacity is 40 seats across 10 four-seat tables.' }, booking_time: { type: 'string', description: 'ISO 8601 date/time including timezone offset' }, duration_minutes: { type: 'integer', minimum: 30, maximum: 240 } }, required: ['booking_time', 'party_size'], additionalProperties: false } },
-  { name: 'request_order_cancel', description: 'Within 5 minutes cancel the current order. After 5 minutes never cancel the original; ask whether the customer wants a separate new order delivered with it.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
+  { name: 'request_order_cancel', description: 'Cancel only within the first 5 minutes after verifying both order reference and customer phone. After 5 minutes cancellation is never allowed; do not create a replacement order from a cancellation request.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
   { name: 'submit_order', description: 'Submit customer-confirmed pickup or delivery order. POS confirmation is asynchronous; report pending until confirmed.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, notes: { type: 'string' }, order_type: { type: 'string', enum: ['pickup', 'delivery'] }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, delivery_address: { type: 'string' }, customer_confirmed: { type: 'boolean' }, related_order_reference: { type: 'string' }, deliver_with_original: { type: 'boolean' } }, required: ['customer_name', 'customer_phone', 'order_type', 'items', 'customer_confirmed'], additionalProperties: false } },
   { name: 'request_order_change', description: '0-5 minutes: replace the complete order after customer confirmation. 5-20 minutes: only add items to the existing bill after confirmation; no cancellation or removals. After 20 minutes: original bill is locked; offer a separate linked order delivered with the original.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' }, requested_changes: { type: 'string' }, items: { type: 'array', items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, customer_confirmed: { type: 'boolean' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'requested_changes'], additionalProperties: false } },
   { name: 'check_order_status', description: 'Look up an order after matching its reference and customer phone.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
