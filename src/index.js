@@ -2496,28 +2496,37 @@ async function recordInboundCallStart(env, tenantId, call) {
   ).bind(tenantId, callId).first();
   if (existing) return { recorded: false, duplicate: true, call_id: callId };
 
+  const callType = clean(call?.type || 'inboundPhoneCall', 40);
+  const direction = norm(callType).includes('outbound') ? 'outbound' : 'inbound';
   const phone = normalizePhone(call?.customer?.number || call?.customer?.phone || call?.from || call?.customerNumber || '');
   const callerRef = await callerFingerprint(env, phone);
-  const since = new Date(Date.now() - REPEAT_WINDOW_MINUTES * 60000).toISOString();
+  const startedAt = nowIso();
   let priorCount = 0;
-  if (phone) {
+
+  // Outbound manager checks are metered but never treated as repeat inbound customers.
+  if (direction === 'inbound' && phone) {
+    const since = new Date(Date.now() - REPEAT_WINDOW_MINUTES * 60000).toISOString();
     const row = await env.DB.prepare(
-      'SELECT COUNT(*) AS n FROM `calls` WHERE `tenant_id` = ? AND `caller_hash` = ? AND `created_at` >= ?'
+      "SELECT COUNT(*) AS n FROM `calls` WHERE `tenant_id` = ? AND `caller_hash` = ? AND `direction` = 'inbound' AND `created_at` >= ?"
     ).bind(tenantId, callerRef, since).first();
     priorCount = Number(row?.n || 0);
   }
-  const startedAt = nowIso();
+
   await insertScoped(env, 'calls', tenantId, [
     [['id'], callId], [['call_id'], callId],
     [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? (phone || null) : null],
-    [['caller_hash'], callerRef], [['purpose'], 'Inbound Vapi call'],
-    [['direction'], clean(call?.type || 'inboundPhoneCall', 40)],
-    [['status'], 'in_progress'], [['started_at'], startedAt],
+    [['caller_hash'], callerRef],
+    [['purpose'], direction === 'outbound' ? 'Vapi outbound manager status call' : 'Inbound Vapi call'],
+    [['direction'], direction], [['status'], 'in_progress'], [['started_at'], startedAt],
     [['billable_minutes'], 0], [['created_at'], startedAt]
   ]);
+
   if (env.CALL_USAGE_WORKFLOW && typeof env.CALL_USAGE_WORKFLOW.create === 'function') {
     try {
-      await env.CALL_USAGE_WORKFLOW.create({ id: 'call-usage-' + callId, params: { tenant_id: tenantId, call_id: callId } });
+      await env.CALL_USAGE_WORKFLOW.create({
+        id: 'call-usage-' + callId,
+        params: { tenant_id: tenantId, call_id: callId }
+      });
     } catch (err) {
       await recordIntegrationStatus(env, tenantId, 'call_usage_workflow', 'start_failed', {
         call_id: callId, code: clean(err?.code || 'call_usage_workflow_failed', 80)
@@ -2525,18 +2534,18 @@ async function recordInboundCallStart(env, tenantId, call) {
     }
   }
 
-  if (!phone || priorCount < 1) {
-    return { recorded: true, call_id: callId, repeat: false, call_count: priorCount + 1 };
+  if (direction === 'outbound' || !phone || priorCount < 1) {
+    return { recorded: true, call_id: callId, direction, repeat: false, call_count: priorCount + 1 };
   }
 
   const windowBucket = Math.floor(Date.now() / (REPEAT_WINDOW_MINUTES * 60000));
   const dedupeKey = 'repeat:' + callerRef + ':' + windowBucket;
-  if (await hasRecentRepeatTask(env, tenantId, dedupeKey, since)) {
-    return { recorded: true, call_id: callId, repeat: true, deduplicated: true, call_count: priorCount + 1 };
+  if (await hasRecentRepeatTask(env, tenantId, dedupeKey, new Date(Date.now() - REPEAT_WINDOW_MINUTES * 60000).toISOString())) {
+    return { recorded: true, call_id: callId, direction, repeat: true, deduplicated: true, call_count: priorCount + 1 };
   }
   const taskId = 'TASK-' + makeId(8);
   const description = 'Repeat caller alert. This caller has placed ' + (priorCount + 1) +
-    ' calls within ' + REPEAT_WINDOW_MINUTES + ' minutes. Caller reference: ' + callerRef +
+    ' inbound calls within ' + REPEAT_WINDOW_MINUTES + ' minutes. Caller reference: ' + callerRef +
     '. Current call ID: ' + callId + '.';
   await insertScoped(env, 'manager_tasks', tenantId, [
     [['id'], taskId], [['task_id'], taskId],
@@ -2552,7 +2561,7 @@ async function recordInboundCallStart(env, tenantId, call) {
     caller_ref: callerRef, call_count: priorCount + 1, call_id: callId,
     task_id: taskId, notifications: notification.queued
   });
-  return { recorded: true, call_id: callId, repeat: true, call_count: priorCount + 1, task_id: taskId, notification };
+  return { recorded: true, call_id: callId, direction, repeat: true, call_count: priorCount + 1, task_id: taskId, notification };
 }
 
 async function storeManagerCallResult(env, tenantId, message) {
