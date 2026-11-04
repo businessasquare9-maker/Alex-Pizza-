@@ -1215,16 +1215,26 @@ async function createBooking(env, tenantId, args) {
     }
   }
   let confirmation = { queued: false, reason: 'no_customer_phone' };
-  if (customerPhone && bookingStatus === 'confirmed') {
+  if (customerPhone) {
     const sender = resolvePhones(env, 'business')[0] || '';
-    confirmation = await queueNotification(env, tenantId, {
-      to: customerPhone,
-      from: sender,
-      message: 'Alex Pizza reservation confirmed for ' + availability.booking_time + ' (' + availability.duration_minutes + ' minutes).',
-      kind: 'booking_confirmation',
-      channel: 'sms',
-      metadata: { booking_id: bookingId, caller_ref: callerRef }
-    });
+    const message = bookingStatus === 'confirmed'
+      ? 'Alex Pizza reservation confirmed for ' + availability.booking_time + ' (' + availability.duration_minutes + ' minutes). Reference: ' + bookingId + '.'
+      : 'Alex Pizza received your reservation request for ' + availability.booking_time + '. Reference: ' + bookingId + '. The team is verifying the calendar entry and will contact you if anything needs attention.';
+    try {
+      confirmation = await queueNotification(env, tenantId, {
+        to: customerPhone,
+        from: sender,
+        message,
+        kind: bookingStatus === 'confirmed' ? 'booking_confirmation' : 'booking_pending_calendar_sync',
+        channel: 'sms',
+        metadata: { booking_id: bookingId, caller_ref: callerRef, calendar_sync_pending: bookingStatus !== 'confirmed' }
+      });
+    } catch (err) {
+      confirmation = { queued: false, error: clean(publicError(err).error, 160) };
+      await recordIntegrationStatus(env, tenantId, 'booking_notification', 'error', {
+        booking_id: bookingId, code: clean(err?.code || 'booking_notification_failed', 80)
+      });
+    }
   }
   await audit(env, tenantId, 'booking_created', {
     booking_id: bookingId, caller_ref: callerRef,
