@@ -547,6 +547,7 @@ async function ensureSchema(env) {
       'ALTER TABLE `orders` ADD COLUMN `related_order_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `delivery_batch_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `scheduled_delivery_at` TEXT',
+      'ALTER TABLE `menu_items` ADD COLUMN `price_cents` INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE `menu_items` ADD COLUMN `size` TEXT',
       'ALTER TABLE `menu_items` ADD COLUMN `flavor` TEXT',
       'ALTER TABLE `menu_items` ADD COLUMN `pos_variant_id` TEXT',
@@ -555,6 +556,10 @@ async function ensureSchema(env) {
       'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER',
       'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT'
     ]) { try { await env.DB.prepare(migration).run(); } catch {} }
+    // Preserve legacy dollar-denominated menu prices when adding the cents column.
+    try {
+      await env.DB.prepare('UPDATE `menu_items` SET `price_cents` = CAST(ROUND(`price` * 100) AS INTEGER) WHERE COALESCE(`price_cents`, 0) = 0 AND `price` IS NOT NULL AND `price` > 0').run();
+    } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tool_call` ON `orders` (`tenant_id`, `tool_call_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tenant_order_id` ON `orders` (`tenant_id`, `order_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_calls_tenant_call_id` ON `calls` (`tenant_id`, `call_id`)').run(); } catch {}
