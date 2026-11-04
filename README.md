@@ -82,14 +82,9 @@ D1 `menu_items` is the menu source of truth. The Worker reads:
 
 The menu sync path is non-destructive. It does not delete or reseed menu rows. Legacy dollar-denominated `price` data is migrated to `price_cents` without replacing the menu.
 
-When a Zoho item ID is missing, the Worker can read the Zoho POS item list and match on:
+When a Zoho item ID is missing, the Worker reads the Zoho POS item list and matches on a unique exact SKU and an active/sellable item. A duplicate Zoho SKU, disabled item, missing SKU, or conflicting pre-existing D1 ID is not guessed or overwritten.
 
-- exact SKU,
-- active / sellable item,
-- exact D1 cents price versus Zoho rate converted to cents,
-- unique Zoho SKU with no conflicting existing D1 mapping.
-
-Only an exact safe match is written to `menu_items.pos_variant_id`. Duplicate SKUs, disabled items, missing SKUs, price differences, and conflicting IDs are not guessed. A CSV template is included as a reference for reconciliation.
+D1 `price_cents` remains the customer-facing source of truth. If Zoho's catalog rate differs, the mapping report records `price_override_required`; the Zoho Sales Order line is still sent with the D1-approved rate in dollars. The product catalog rate itself is not silently changed. A CSV template is included for reconciliation.
 
 Zoho POS API scopes used by this integration:
 - `ZohoPOSAPI.items.READ`
