@@ -1366,8 +1366,8 @@ async function detectRepeatCaller(env, tenantId, customerPhone, purpose = 'Order
 
   if (priorCount < 1) return { flagged: false, callCount: 1, callerRef };
 
-  const windowBucket = Math.floor(Date.now() / (REPEAT_WINDOW_MINUTES * 60000));
-  const dedupeKey = 'repeat:' + callerRef + ':' + windowBucket;
+  // Rolling 30-minute dedupe avoids duplicate alerts when calls straddle a clock bucket.
+  const dedupeKey = 'repeat:' + callerRef;
   if (await hasRecentRepeatTask(env, tenantId, dedupeKey, since)) {
     return { flagged: true, callCount: priorCount + 1, callerRef, taskId: null, deduplicated: true };
   }
@@ -3007,8 +3007,8 @@ async function recordInboundCallStart(env, tenantId, call) {
     return { recorded: true, call_id: callId, direction, repeat: false, call_count: priorCount + 1 };
   }
 
-  const windowBucket = Math.floor(Date.now() / (REPEAT_WINDOW_MINUTES * 60000));
-  const dedupeKey = 'repeat:' + callerRef + ':' + windowBucket;
+  // Rolling 30-minute dedupe avoids duplicate alerts when calls straddle a clock bucket.
+  const dedupeKey = 'repeat:' + callerRef;
   if (await hasRecentRepeatTask(env, tenantId, dedupeKey, new Date(Date.now() - REPEAT_WINDOW_MINUTES * 60000).toISOString())) {
     return { recorded: true, call_id: callId, direction, repeat: true, deduplicated: true, call_count: priorCount + 1 };
   }
