@@ -1524,6 +1524,19 @@ async function queueNotification(env, tenantId, options) {
     delivery = { delivered: false, skipped: false, error: clean(publicError(err).error, 160) };
     await setNotificationStatus(env, tenantId, id, 'provider_error');
   }
+  if (!delivery.delivered && env.NOTIFICATION_WORKFLOW && typeof env.NOTIFICATION_WORKFLOW.create === 'function') {
+    try {
+      await env.NOTIFICATION_WORKFLOW.create({
+        id: 'notification-' + id.toLowerCase(),
+        params: { tenant_id: tenantId, notification_id: id }
+      });
+      await setNotificationStatus(env, tenantId, id, 'retry_scheduled');
+    } catch (err) {
+      await recordIntegrationStatus(env, tenantId, 'notification_workflow', 'start_failed', {
+        notification_id: id, code: clean(err?.code || 'notification_workflow_failed', 80)
+      });
+    }
+  }
   return { id, queued: true, channel, ...delivery };
 }
 async function queueRoleNotification(env, tenantId, role, message, kind) {
@@ -3309,6 +3322,55 @@ async function handleScheduled(env) {
   } catch (err) {
     safeLog(err);
     return { ok: false, ...publicError(err) };
+  }
+}
+
+export class NotificationDeliveryWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    const tenantId = validateTenant(event?.payload?.tenant_id);
+    const notificationId = clean(event?.payload?.notification_id || '', 100);
+    if (!notificationId) throw new AppError('Notification workflow requires notification_id.', 'notification_id_required', 400);
+    await ensureTenantActive(this.env, tenantId);
+    const retryDelays = ['30 seconds', '1 minute', '3 minutes', '10 minutes'];
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      if (attempt > 1) await step.sleep('notification-retry-delay-' + attempt, retryDelays[attempt - 2]);
+      const result = await step.do('notification-delivery-attempt-' + attempt, {
+        retries: { limit: 2, delay: '5 seconds', backoff: 'exponential' }, timeout: '30 seconds'
+      }, async () => {
+        const row = await this.env.DB.prepare(
+          'SELECT * FROM `notifications` WHERE `tenant_id` = ? AND (`notification_id` = ? OR `id` = ?) LIMIT 1'
+        ).bind(tenantId, notificationId, notificationId).first();
+        if (!row) return { done: true, reason: 'notification_not_found' };
+        if (['sent_to_provider', 'delivered', 'sent'].includes(norm(row.status))) {
+          return { done: true, reason: 'already_sent' };
+        }
+        const metadataRaw = row.metadata || '{}';
+        let metadata = {};
+        try { metadata = JSON.parse(metadataRaw); } catch {}
+        const payload = {
+          notification_id: notificationId, tenant_id: tenantId,
+          to: row.recipient_phone || row.to_phone || '',
+          from: row.sender_phone || row.from_phone || '',
+          channel: row.channel || 'sms',
+          kind: row.notification_type || row.type || 'general',
+          message: row.message || '', metadata
+        };
+        const delivery = await deliverNotification(this.env, payload);
+        if (delivery?.delivered) {
+          await setNotificationStatus(this.env, tenantId, notificationId, 'sent_to_provider', delivery.provider_message_id);
+          return { done: true, delivered: true, provider: delivery.provider || 'configured_provider' };
+        }
+        await setNotificationStatus(this.env, tenantId, notificationId,
+          delivery?.skipped ? 'queued' : 'provider_error');
+        return { done: false, skipped: Boolean(delivery?.skipped), error: clean(delivery?.error || delivery?.reason || 'provider_not_confirmed', 160) };
+      });
+      if (result?.done) return { ok: true, tenant_id: tenantId, notification_id: notificationId, ...result, attempts: attempt };
+    }
+    await setNotificationStatus(this.env, tenantId, notificationId, 'retry_exhausted');
+    await recordIntegrationStatus(this.env, tenantId, 'notifications', 'retry_exhausted', {
+      notification_id: notificationId, attempts: 5
+    });
+    return { ok: false, tenant_id: tenantId, notification_id: notificationId, status: 'retry_exhausted', attempts: 5 };
   }
 }
 
