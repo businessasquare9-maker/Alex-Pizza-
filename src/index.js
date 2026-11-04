@@ -2737,8 +2737,9 @@ async function storeManagerCallResult(env, tenantId, message) {
     ? artifact.messages.filter(item => norm(item?.role) === 'user')
         .map(item => clean(item?.message || item?.content || item?.transcript || '', 1000)).filter(Boolean)
     : [];
-  const transcript = clean(artifact.transcript || '', 5000);
-  const managerResponse = clean(userLines.join('\n') || transcript, 4000);
+  // Only manager/user-role messages count as evidence. A raw combined transcript may
+  // contain only the outbound assistant's prompt and must never be treated as a reply.
+  const managerResponse = clean(userLines.join('\n'), 4000);
   const endedReason = clean(message?.endedReason || message?.call?.endedReason || '', 100);
   const finalStatus = managerResponse ? 'completed' : 'no_manager_response';
   const storedResponse = managerResponse || ('Manager call ended without a captured reply. ' + endedReason).slice(0, 4000);
@@ -2747,6 +2748,9 @@ async function storeManagerCallResult(env, tenantId, message) {
   ).bind(finalStatus, storedResponse, nowIso(), nowIso(), tenantId, row.id).run();
 
   let customerCallback = { sent: false, reason: 'no_inbound_control_url' };
+  if (norm(row.callback_status) === 'sent') {
+    return { matched: true, check_id: row.id, status: finalStatus, customer_callback: { sent: true, duplicate: true } };
+  }
   const inboundCallId = clean(row.inbound_call_id || '', 120);
   const controlUrl = clean(row.inbound_control_url || '', 1000);
   if (inboundCallId && controlUrl) {
@@ -3006,13 +3010,17 @@ const TOOL_HANDLERS = {
   async get_order_status(env, tenantId, args, ctx) {
     const verifiedOrder = await getOrderStatus(env, tenantId, args);
     const managerCheck = await requestManagerStatusCheck(env, tenantId, args, ctx);
-    return {
-      ...verifiedOrder,
-      manager_check: managerCheck,
-      message_for_assistant: managerCheck.status === 'manager_response_received'
-        ? 'The manager response has been received. Relay the manager-reported status to the customer; do not transfer.'
-        : 'The order reference and customer phone were verified. The AI has contacted or is contacting the manager. Keep the customer with the AI, ask them to hold, and call request_manager_status_check again with the same order reference and phone to retrieve the manager reply. Never invent a status.'
-    };
+    let guidance;
+    if (managerCheck.status === 'manager_response_received') {
+      guidance = 'The manager response has been received. Relay the manager-reported status to the customer. Do not transfer the customer.';
+    } else if (['manager_call_started', 'waiting_for_manager'].includes(managerCheck.status)) {
+      guidance = 'The manager has been called and the customer is waiting. Ask the customer to hold. The verified manager response will be spoken automatically into this same call when the manager call ends. Do not call the manager again, do not invent status, and do not transfer.';
+    } else if (managerCheck.status === 'manager_callback_required') {
+      guidance = 'The manager could not confirm the status yet. Explain that clearly, do not invent an answer, keep the customer with the AI, and do not transfer unless the customer explicitly complains.';
+    } else {
+      guidance = clean(managerCheck.message_for_assistant || 'The manager status check could not be completed. Do not invent an answer or transfer the customer unless the customer explicitly complains.', 1000);
+    }
+    return { ...verifiedOrder, manager_check: managerCheck, message_for_assistant: guidance };
   },
   async request_order_change(env, tenantId, args) {
     return await requestOrderChange(env, tenantId, args);
@@ -3176,8 +3184,10 @@ async function handleVapiEvents(request, env, tenantId) {
   if (!callId) return json(request, env, { ok: true, skipped: 'missing_call_id', manager_status: managerResult });
 
   let seconds = Number(message.durationSeconds) || (Number(message.durationMs) / 1000) || 0;
-  if (!seconds && message.startedAt && message.endedAt) {
-    seconds = (new Date(message.endedAt).getTime() - new Date(message.startedAt).getTime()) / 1000;
+  const reportStartedAt = message.startedAt || message.call?.startedAt || message.call?.createdAt || null;
+  const reportEndedAt = message.endedAt || message.call?.endedAt || null;
+  if (!seconds && reportStartedAt && reportEndedAt) {
+    seconds = (new Date(reportEndedAt).getTime() - new Date(reportStartedAt).getTime()) / 1000;
   }
   if (!Number.isFinite(seconds) || seconds <= 0) {
     await env.DB.prepare(
@@ -3201,7 +3211,7 @@ async function handleVapiEvents(request, env, tenantId) {
       'UPDATE `calls` SET `status` = ?, `duration_seconds` = ?, `billable_minutes` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ?'
     ).bind('ended', Math.ceil(seconds), Math.ceil(seconds / 60), new Date(endedAt).toISOString(), tenantId, callId).run();
   } else {
-    const startedAt = message.startedAt || message.call?.createdAt || endedAt;
+    const startedAt = reportStartedAt || endedAt;
     await insertScoped(env, 'calls', tenantId, [
       [['id'], callId], [['call_id'], callId],
       [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? normalizePhone(message.call?.customer?.number || '') : null],
