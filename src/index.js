@@ -626,11 +626,10 @@ async function rowsForTenant(env, table, tenantId, limit = 500) {
   ).bind(tenantId, Math.max(1, Math.min(1000, Number(limit) || 500))).all();
   return result.results || [];
 }
-async function insertScoped(env, table, tenantId, entries) {
+async function prepareScopedInsert(env, table, tenantId, entries) {
   const columns = await getColumns(env, table);
   const scopeColumn = findColumn(columns, TENANT_COLUMNS);
   if (!scopeColumn) throw new AppError('Table lacks a tenant column: ' + table, 'tenant_column_missing', 500);
-
   const data = { [scopeColumn]: tenantId };
   for (const [aliases, value] of entries || []) {
     if (value === undefined || value === null) continue;
@@ -638,7 +637,6 @@ async function insertScoped(env, table, tenantId, entries) {
     const column = findColumn(columns, candidates);
     if (column) data[column] = value;
   }
-
   const singular = table.endsWith('s') ? table.slice(0, -1) : table;
   const idColumn = findColumn(columns, ['id', singular + '_id', 'uuid']);
   if (idColumn && data[idColumn] === undefined) data[idColumn] = makeId(16);
@@ -646,15 +644,20 @@ async function insertScoped(env, table, tenantId, entries) {
   if (createdColumn && data[createdColumn] === undefined) data[createdColumn] = nowIso();
   const updatedColumn = findColumn(columns, ['updated_at', 'updatedAt']);
   if (updatedColumn && data[updatedColumn] === undefined) data[updatedColumn] = nowIso();
-
   const keys = Object.keys(data);
   const names = keys.map(key => q(key)).join(', ');
   const placeholders = keys.map(() => '?').join(', ');
-  await env.DB.prepare(
+  const statement = env.DB.prepare(
     `INSERT INTO ${q(table)} (${names}) VALUES (${placeholders})`
-  ).bind(...keys.map(key => data[key])).run();
-  return data;
+  ).bind(...keys.map(key => data[key]));
+  return { statement, data };
 }
+async function insertScoped(env, table, tenantId, entries) {
+  const prepared = await prepareScopedInsert(env, table, tenantId, entries);
+  await prepared.statement.run();
+  return prepared.data;
+}
+
 async function audit(env, tenantId, event, details = {}) {
   try {
     await insertScoped(env, 'audit_log', tenantId, [
@@ -1972,53 +1975,45 @@ async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, re
   })();
   const notes = clean(args.notes || args.special_instructions || '', 1000);
   const createdAt = nowIso();
-  await insertScoped(env, 'orders', tenantId, [
-    [['id'], orderId],
-    [['order_id'], orderId],
+
+  const orderInsert = await prepareScopedInsert(env, 'orders', tenantId, [
+    [['id'], orderId], [['order_id'], orderId],
     [['customer_name', 'name'], customerName],
     [['customer_phone', 'phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? customerPhone : null],
-    [['caller_hash'], callerRef],
-    [['order_type', 'fulfillment_type'], orderType],
+    [['caller_hash'], callerRef], [['order_type', 'fulfillment_type'], orderType],
     [['delivery_address'], clean(args.delivery_address || '', 300) || null],
     [['related_order_id'], clean(args.__related_order_id || '', 100) || null],
     [['delivery_batch_id'], clean(args.__delivery_batch_id || '', 100) || null],
     [['scheduled_delivery_at'], clean(args.__scheduled_delivery_at || '', 80) || null],
     [['tool_call_id'], clean(args.__tool_call_id || '', 120) || null],
-    [['total', 'total_amount', 'amount'], total],
-    [['currency'], CURRENCY],
+    [['total', 'total_amount', 'amount'], total], [['currency'], CURRENCY],
     [['items_json', 'items'], JSON.stringify(pricedItems).slice(0, 8000)],
-    [['status'], 'submitted'],
-    [['notes', 'special_instructions'], notes],
-    [['created_at'], createdAt],
-    [['updated_at'], createdAt]
+    [['status'], 'submitted'], [['notes', 'special_instructions'], notes],
+    [['created_at'], createdAt], [['updated_at'], createdAt]
   ]);
+
+  const itemInserts = [];
   for (const item of pricedItems) {
-    await insertScoped(env, 'order_items', tenantId, [
-      [['id'], makeId(16)],
-      [['order_id'], orderId],
-      [['sku'], item.sku],
-      [['name', 'item_name'], item.name],
-      [['category'], item.category],
-      [['unit_price', 'price'], item.unitPrice],
-      [['quantity'], item.quantity],
-      [['line_total'], item.lineTotal],
-      [['created_at'], createdAt]
+    const prepared = await prepareScopedInsert(env, 'order_items', tenantId, [
+      [['id'], makeId(16)], [['order_id'], orderId], [['sku'], item.sku],
+      [['name', 'item_name'], item.name], [['category'], item.category],
+      [['unit_price', 'price'], item.unitPrice], [['quantity'], item.quantity],
+      [['line_total'], item.lineTotal], [['created_at'], createdAt]
     ]);
+    itemInserts.push(prepared.statement);
   }
+
+  // D1 batch is a transaction: either the bill and every item row are committed,
+  // or none of them are, preventing partially-created customer bills.
+  await env.DB.batch([orderInsert.statement, ...itemInserts]);
+
   return {
-    order_id: orderId,
-    customer_name: customerName,
-    customerPhone,
-    callerRef,
-    order_type: orderType,
-    currency: CURRENCY,
-    total,
-    items: pricedItems,
-    notes,
-    status: 'submitted',
-    createdAt
+    order_id: orderId, customer_name: customerName, customerPhone,
+    callerRef, order_type: orderType, currency: CURRENCY, total,
+    items: pricedItems, notes, status: 'submitted', createdAt
   };
 }
+
 async function submitOrder(env, tenantId, args, ctx) {
   await ensureSchema(env);
   const orderHours = isWithinBusinessHours(new Date(), businessConfig(env));
