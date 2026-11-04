@@ -1982,12 +1982,30 @@ async function pushOrderToZoho(env, tenantId, order) {
     await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', { order_id: order.order_id, missing });
     return { pushed: false, reason: 'zoho_pos_configuration_incomplete', missing };
   }
-  const itemIdMap = await loadZohoItemIdMap(env, tenantId);
-  const itemIdFor = sku => itemIdMap[norm(sku)] || itemIdMap[String(sku || '').toUpperCase()] || '';
-  const missingSkus = order.items.filter(item => !itemIdFor(item.sku)).map(item => item.sku);
+  let itemIdMap = await loadZohoItemIdMap(env, tenantId);
+  let itemIdFor = sku => itemIdMap[norm(sku)] || itemIdMap[String(sku || '').toUpperCase()] || '';
+  let missingSkus = order.items.filter(item => !itemIdFor(item.sku)).map(item => item.sku);
+  if (missingSkus.length) {
+    try {
+      const mappingReport = await buildZohoMenuMappingReport(env, tenantId);
+      await applyZohoMenuMapping(env, tenantId, mappingReport);
+      itemIdMap = await loadZohoItemIdMap(env, tenantId);
+      itemIdFor = sku => itemIdMap[norm(sku)] || itemIdMap[String(sku || '').toUpperCase()] || '';
+      missingSkus = order.items.filter(item => !itemIdFor(item.sku)).map(item => item.sku);
+      await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'automatic_sku_mapping_attempted', {
+        order_id: order.order_id, exact_matches: mappingReport.exact_matches,
+        needs_attention: mappingReport.needs_attention, remaining_missing_skus: missingSkus
+      });
+    } catch (err) {
+      await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'automatic_sku_mapping_failed', {
+        order_id: order.order_id, code: clean(err?.code || 'zoho_item_mapping_failed', 80),
+        message: clean(publicError(err).error, 180)
+      });
+    }
+  }
   if (missingSkus.length) {
     await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'configuration_error', { order_id: order.order_id, missing_item_skus: missingSkus });
-    return { pushed: false, reason: 'zoho_item_id_mapping_missing', missing_item_skus: missingSkus };
+    return { pushed: false, reason: 'zoho_item_id_mapping_missing_or_price_mismatch', missing_item_skus: missingSkus };
   }
   const customerIdNumber = Number(customerId);
   const lineItems = order.items.map((item, index) => ({
