@@ -2444,23 +2444,263 @@ async function requestOrderCancellation(env, tenantId, args) {
   };
 }
 
-async function transferToManager(env, tenantId, args) {
+async function recordInboundCallStart(env, tenantId, call) {
+  await ensureSchema(env);
+  const callId = clean(call?.id || '', 120);
+  if (!callId) return { recorded: false, reason: 'missing_call_id' };
+  const existing = await env.DB.prepare(
+    'SELECT 1 FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+  ).bind(tenantId, callId).first();
+  if (existing) return { recorded: false, duplicate: true, call_id: callId };
+
+  const phone = normalizePhone(call?.customer?.number || call?.customer?.phone || call?.from || call?.customerNumber || '');
+  const callerRef = await callerFingerprint(env, phone);
+  const since = new Date(Date.now() - REPEAT_WINDOW_MINUTES * 60000).toISOString();
+  let priorCount = 0;
+  if (phone) {
+    const row = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM `calls` WHERE `tenant_id` = ? AND `caller_hash` = ? AND `created_at` >= ?'
+    ).bind(tenantId, callerRef, since).first();
+    priorCount = Number(row?.n || 0);
+  }
+  const startedAt = nowIso();
+  await insertScoped(env, 'calls', tenantId, [
+    [['id'], callId], [['call_id'], callId],
+    [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? (phone || null) : null],
+    [['caller_hash'], callerRef],
+    [['purpose'], 'Inbound Vapi call'],
+    [['direction'], clean(call?.type || 'inboundPhoneCall', 40)],
+    [['status'], 'in_progress'],
+    [['started_at'], startedAt],
+    [['created_at'], startedAt]
+  ]);
+
+  if (!phone || priorCount < 1) {
+    return { recorded: true, call_id: callId, repeat: false, call_count: priorCount + 1 };
+  }
+
+  const windowBucket = Math.floor(Date.now() / (REPEAT_WINDOW_MINUTES * 60000));
+  const dedupeKey = 'repeat:' + callerRef + ':' + windowBucket;
+  if (await hasRecentRepeatTask(env, tenantId, dedupeKey, since)) {
+    return { recorded: true, call_id: callId, repeat: true, deduplicated: true, call_count: priorCount + 1 };
+  }
+  const taskId = 'TASK-' + makeId(8);
+  const description = 'Repeat caller alert. This caller has placed ' + (priorCount + 1) +
+    ' calls within ' + REPEAT_WINDOW_MINUTES + ' minutes. Caller reference: ' + callerRef +
+    '. Current call ID: ' + callId + '.';
+  await insertScoped(env, 'manager_tasks', tenantId, [
+    [['id'], taskId], [['task_id'], taskId],
+    [['title'], 'HIGH PRIORITY: Repeat caller within 30 minutes'],
+    [['description'], description], [['priority'], 'urgent'],
+    [['status'], 'flagged_repeat_caller'], [['caller_hash'], callerRef],
+    [['dedupe_key'], dedupeKey], [['created_at'], startedAt]
+  ]);
+  let notification = { queued: 0, reason: 'manager_phone_unavailable' };
+  try { notification = await queueRoleNotification(env, tenantId, 'manager', description, 'repeat_caller_alert'); }
+  catch (err) { notification = { queued: 0, reason: clean(err?.code || 'notification_failed', 80) }; }
+  await audit(env, tenantId, 'repeat_caller_flagged_at_call_start', {
+    caller_ref: callerRef, call_count: priorCount + 1, call_id: callId,
+    task_id: taskId, notifications: notification.queued
+  });
+  return { recorded: true, call_id: callId, repeat: true, call_count: priorCount + 1, task_id: taskId, notification };
+}
+
+async function storeManagerCallResult(env, tenantId, message) {
+  await ensureSchema(env);
+  const callId = clean(message?.call?.id || message?.callId || '', 120);
+  if (!callId) return { matched: false, reason: 'missing_call_id' };
+  const row = await env.DB.prepare(
+    'SELECT * FROM `manager_status_checks` WHERE `tenant_id` = ? AND `outbound_call_id` = ? LIMIT 1'
+  ).bind(tenantId, callId).first();
+  if (!row) return { matched: false };
+  const artifact = message?.artifact || {};
+  const userLines = Array.isArray(artifact.messages)
+    ? artifact.messages.filter(item => norm(item?.role) === 'user')
+        .map(item => clean(item?.message || item?.content || item?.transcript || '', 1000)).filter(Boolean)
+    : [];
+  const transcript = clean(artifact.transcript || '', 5000);
+  const managerResponse = clean(userLines.join('\n') || transcript, 4000);
+  const endedReason = clean(message?.endedReason || message?.call?.endedReason || '', 100);
+  const finalStatus = managerResponse ? 'completed' : 'no_manager_response';
+  await env.DB.prepare(
+    'UPDATE `manager_status_checks` SET `status` = ?, `manager_response` = ?, `completed_at` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND `id` = ?'
+  ).bind(finalStatus, managerResponse || ('Manager call ended without a captured reply. ' + endedReason).slice(0, 4000),
+    nowIso(), nowIso(), tenantId, row.id).run();
+  await audit(env, tenantId, 'manager_status_call_completed', {
+    check_id: row.id, order_reference: row.order_reference, status: finalStatus,
+    response_captured: Boolean(managerResponse), ended_reason: endedReason
+  });
+  return { matched: true, check_id: row.id, status: finalStatus };
+}
+
+async function initiateManagerStatusCall(env, tenantId, order, checkId, managerPhone, context = {}) {
+  const apiKey = envValue(env, ENV_KEYS.vapiApiKey);
+  const assistantId = envValue(env, ENV_KEYS.vapiAssistantId);
+  const phoneNumberId = envValue(env, ENV_KEYS.vapiPhoneNumberId) || clean(context.phoneNumberId || '', 120);
+  if (!apiKey || !assistantId || !phoneNumberId) {
+    throw new AppError('Vapi outbound manager-call settings are incomplete.', 'manager_call_config_incomplete', 503);
+  }
+  const systemPrompt = [
+    'You are Alex Pizza NYC internal manager-status assistant, not the customer-facing restaurant agent.',
+    'You are calling the Alex Pizza manager to obtain a factual status update for an existing customer order.',
+    'Ask for the kitchen/POS progress of order reference ' + order.order_id + '.',
+    'Ask whether it is accepted, being prepared, ready for pickup, dispatched, delivered, delayed, or unavailable.',
+    'Ask for the estimated ready/delivery time if known and any short explanation the customer can be told.',
+    'Do not invent a status, do not claim an order is complete without the manager saying so, and do not place, edit, or cancel orders.',
+    'Repeat the order reference to the manager to avoid mixing orders. Confirm the final answer clearly, then politely end the call.'
+  ].join(' ');
+  const payload = {
+    assistantId,
+    phoneNumberId,
+    customer: { number: managerPhone, name: 'Alex Pizza Manager' },
+    name: 'Alex Pizza order status ' + order.order_id,
+    assistantOverrides: {
+      firstMessage: 'Hello, this is the Alex Pizza automated order-status desk. I am checking order ' + order.order_id + '. Could you tell me its current kitchen or delivery status and the estimated completion time?',
+      firstMessageMode: 'assistant-speaks-first',
+      model: { messages: [{ role: 'system', content: systemPrompt }], tools: [] },
+      variableValues: {
+        tenantId, orderReference: order.order_id,
+        customerReference: checkId, taskType: 'manager_order_status'
+      }
+    }
+  };
+  const response = await fetchWithTimeout('https://api.vapi.ai/call', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }, 8000);
+  let data = {};
+  try { data = await response.json(); } catch {}
+  if (!response.ok || !data.id) {
+    throw new AppError('Vapi could not start the manager status call: ' + clean(data.message || data.error || ('HTTP ' + response.status), 160),
+      'manager_call_start_failed', 502, { provider_status: response.status });
+  }
+  await env.DB.prepare(
+    'UPDATE `manager_status_checks` SET `outbound_call_id` = ?, `status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND `id` = ?'
+  ).bind(clean(data.id, 120), 'calling_manager', nowIso(), tenantId, checkId).run();
+  return { call_id: clean(data.id, 120), status: clean(data.status || 'queued', 40) };
+}
+
+async function transferToManager(env, tenantId, args, context = {}) {
   const reason = clean(args.reason || '', 1000);
   if (!reason) throw new AppError('reason is required.', 'reason_required', 400);
   const ref = clean(args.order_reference || '', 100);
-  const task = await createManagerTask(env, tenantId, 'Live manager assistance requested',
-    reason + (ref ? '. Related order: ' + ref : ''), 'urgent');
-  await audit(env, tenantId, 'manager_transfer_requested', { order_reference: ref || null, task_id: task.task_id });
-  return { ok: true, transfer_status: 'manager_callback_requested', ...task };
+  const managerPhone = requirePhones(env, 'manager')[0];
+  const controlUrl = clean(context.controlUrl || '', 1000);
+  if (!controlUrl) {
+    const task = await createManagerTask(env, tenantId, 'Complaint requires manager assistance',
+      reason + (ref ? '. Related order: ' + ref : '') + '. Live Vapi call-control URL was not present; manager callback is required.', 'urgent');
+    await audit(env, tenantId, 'manager_live_transfer_unavailable', { order_reference: ref || null, task_id: task.task_id });
+    return { ok: true, transfer_status: 'manager_callback_requested', live_transfer_started: false, ...task };
+  }
+  let parsed;
+  try { parsed = new URL(controlUrl); } catch { throw new AppError('Vapi live call control URL is invalid.', 'invalid_call_control_url', 502); }
+  if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.vapi.ai') || !parsed.pathname.endsWith('/control')) {
+    throw new AppError('Vapi live call control URL failed origin validation.', 'invalid_call_control_url', 502);
+  }
+  const response = await fetchWithTimeout(parsed.toString(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'transfer',
+      destination: { type: 'number', number: managerPhone },
+      content: 'I am sorry about that. I will connect you with the Alex Pizza manager now.'
+    })
+  }, 8000);
+  let data = {};
+  try { data = await response.json(); } catch {}
+  if (!response.ok) {
+    const task = await createManagerTask(env, tenantId, 'Complaint transfer could not be completed',
+      reason + (ref ? '. Related order: ' + ref : '') + '. Vapi transfer control returned HTTP ' + response.status + '.', 'urgent');
+    await audit(env, tenantId, 'manager_live_transfer_failed', { order_reference: ref || null, provider_status: response.status, task_id: task.task_id });
+    return { ok: true, transfer_status: 'manager_callback_requested', live_transfer_started: false, ...task };
+  }
+  const taskId = 'TASK-' + makeId(8);
+  await insertScoped(env, 'manager_tasks', tenantId, [
+    [['id'], taskId], [['task_id'], taskId],
+    [['title'], 'Customer complaint — live manager transfer initiated'],
+    [['description'], reason + (ref ? '. Related order: ' + ref : '')],
+    [['priority'], 'urgent'], [['status'], 'live_transfer_initiated'],
+    [['created_at'], nowIso()]
+  ]);
+  await audit(env, tenantId, 'manager_live_transfer_initiated', { order_reference: ref || null, task_id: taskId });
+  return { ok: true, transfer_status: 'live_transfer_command_sent', live_transfer_started: true, task_id: taskId,
+    message_for_assistant: 'A live transfer command was sent to Vapi. Do not claim that the manager answered; the call provider completes the connection.' };
 }
-async function requestManagerStatusCheck(env, tenantId, args) {
+
+async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
+  await ensureSchema(env);
   const phone = customerPhoneFrom(args, true);
   const orderId = clean(args.order_reference || '', 100);
   if (!orderId) throw new AppError('order_reference is required.', 'order_reference_required', 400);
-  const order = await getOrderStatus(env, tenantId, { order_id: orderId, customer_phone: phone });
-  const task = await createManagerTask(env, tenantId, 'Manager order status check requested',
-    'Customer requested a manual status check for order ' + orderId + '. Current system status: ' + order.status + '. Customer phone: ' + phone);
-  return { ok: true, order_reference: orderId, current_status: order.status, ...task };
+  const orderStatus = await getOrderStatus(env, tenantId, { order_id: orderId, customer_phone: phone });
+  const callerRef = await callerFingerprint(env, phone);
+  const existing = await env.DB.prepare(
+    'SELECT * FROM `manager_status_checks` WHERE `tenant_id` = ? AND `order_reference` = ? AND `caller_hash` = ? ORDER BY `created_at` DESC LIMIT 1'
+  ).bind(tenantId, orderId, callerRef).first();
+  if (existing && norm(existing.status) === 'completed' && clean(existing.manager_response || '', 20)) {
+    return {
+      ok: true, order_reference: orderId, current_system_status: orderStatus.status,
+      manager_status: existing.manager_response,
+      status: 'manager_response_received',
+      message_for_assistant: 'The manager has supplied this status. Tell the customer the manager-reported status clearly. Do not transfer the customer.'
+    };
+  }
+  if (existing && ['initiating', 'calling_manager', 'queued', 'in-progress'].includes(norm(existing.status))) {
+    return {
+      ok: true, order_reference: orderId, current_system_status: orderStatus.status,
+      manager_call_status: existing.status, status: 'waiting_for_manager',
+      message_for_assistant: 'The manager call is still in progress. Tell the customer you are checking with the manager and ask them to hold. Call request_manager_status_check again with the same order reference and customer phone after a short pause. Do not invent a status and do not transfer the customer.'
+    };
+  }
+
+  const managerPhone = requirePhones(env, 'manager')[0];
+  const checkId = 'MSC-' + makeId(8);
+  await insertScoped(env, 'manager_status_checks', tenantId, [
+    [['id'], checkId], [['order_reference'], orderId],
+    [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? phone : null],
+    [['caller_hash'], callerRef], [['manager_phone'], managerPhone],
+    [['inbound_call_id'], clean(context.callId || '', 120)],
+    [['status'], 'initiating'], [['started_at'], nowIso()], [['created_at'], nowIso()], [['updated_at'], nowIso()]
+  ]);
+  // Keep the customer informed while the outbound manager check runs.
+  if (context.controlUrl) {
+    try {
+      const u = new URL(context.controlUrl);
+      if (u.protocol === 'https:' && u.hostname.endsWith('.vapi.ai') && u.pathname.endsWith('/control')) {
+        await fetchWithTimeout(u.toString(), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'say', content: 'Please hold for a moment while I contact the manager to verify your order status.', endCallAfterSpoken: false })
+        }, 4000);
+      }
+    } catch {}
+  }
+  try {
+    const managerCall = await initiateManagerStatusCall(env, tenantId, {
+      order_id: orderId,
+      customer_name: 'Customer order status enquiry'
+    }, checkId, managerPhone, context);
+    await audit(env, tenantId, 'manager_status_call_started', {
+      check_id: checkId, order_reference: orderId, inbound_call_id: clean(context.callId || '', 120),
+      outbound_call_id: managerCall.call_id
+    });
+    return {
+      ok: true, order_reference: orderId, current_system_status: orderStatus.status,
+      manager_call_status: managerCall.status, status: 'manager_call_started',
+      message_for_assistant: 'You have called the manager. Tell the customer you are checking and ask them to hold. Invoke request_manager_status_check again with the same order_reference and customer_phone after a short pause to retrieve the manager response. Never state a guessed order status and never transfer the customer for a routine status check.'
+    };
+  } catch (err) {
+    await env.DB.prepare(
+      'UPDATE `manager_status_checks` SET `status` = ?, `manager_response` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND `id` = ?'
+    ).bind('call_start_failed', clean(publicError(err).error, 500), nowIso(), tenantId, checkId).run();
+    const task = await createManagerTask(env, tenantId, 'Manager order status callback required',
+      'Could not start automated manager call for order ' + orderId + '. Current system status: ' + orderStatus.status + '. Please call the customer back or update the dashboard.', 'urgent');
+    return {
+      ok: true, order_reference: orderId, current_system_status: orderStatus.status,
+      manager_call_status: 'callback_required', status: 'manager_callback_requested',
+      manager_task_id: task.task_id, message_for_assistant: 'The automated manager call could not start. Tell the customer you are unable to reach the manager right now, do not invent a status, record the manager callback task, and keep the call with the AI. Do not transfer unless the customer has a complaint.'
+    };
+  }
 }
 
 const TOOL_HANDLERS = {
@@ -2509,11 +2749,11 @@ const TOOL_HANDLERS = {
   async send_booking_notifications(env, tenantId, args) {
     return await sendBookingNotifications(env, tenantId, args);
   },
-  async transfer_to_manager(env, tenantId, args) {
-    return await transferToManager(env, tenantId, args);
+  async transfer_to_manager(env, tenantId, args, ctx) {
+    return await transferToManager(env, tenantId, args, ctx);
   },
-  async request_manager_status_check(env, tenantId, args) {
-    return await requestManagerStatusCheck(env, tenantId, args);
+  async request_manager_status_check(env, tenantId, args, ctx) {
+    return await requestManagerStatusCheck(env, tenantId, args, ctx);
   },
   async request_order_cancel(env, tenantId, args) {
     return await requestOrderCancellation(env, tenantId, args);
@@ -2528,8 +2768,8 @@ const TOOL_HANDLERS = {
 // end_outbound_call is a Vapi-native call-control action, not a Worker HTTP function. Configure it as a native Vapi tool.
 const TOOL_CATALOG = [
   { name: 'send_booking_notification', description: 'Send booking notifications using an existing booking reference.', parameters: { type: 'object', properties: { booking_id: { type: 'string' } }, required: ['booking_id'], additionalProperties: false } },
-  { name: 'transfer_to_manager', description: 'Use only for customer complaints that require a human. Creates an urgent manager assistance task; this does not itself transfer the live call.', parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Brief explanation of why human assistance is required.' }, order_reference: { type: 'string' } }, required: ['reason'], additionalProperties: false } },
-  { name: 'request_manager_status_check', description: 'Verify order reference and customer phone, then request manager status check.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
+  { name: 'transfer_to_manager', description: 'Use only when the customer explicitly complains and wants human assistance. Sends a live Vapi transfer command to the configured Alex Pizza manager phone number. Never use for normal order-status questions.', parameters: { type: 'object', properties: { reason: { type: 'string', description: 'Brief explanation of why human assistance is required.' }, order_reference: { type: 'string' } }, required: ['reason'], additionalProperties: false } },
+  { name: 'request_manager_status_check', description: 'Verify order reference and customer phone. The Worker calls the manager using Vapi outbound calling, keeps the customer with the AI, and stores the manager reply from the Vapi call-end webhook. Call this function again with the same details to retrieve the reply; never invent a status.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
   { name: 'book_table', description: 'Create a table reservation after checking availability and calendar synchronization.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40 }, booking_time: { type: 'string' }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, duration_minutes: { type: 'integer' } }, required: ['customer_name', 'customer_phone', 'booking_time', 'party_size'], additionalProperties: false } },
   { name: 'check_table_availability', description: 'Check reservation availability in America/New_York business time.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40, description: 'Number of guests; restaurant capacity is 40 seats across 10 four-seat tables.' }, booking_time: { type: 'string', description: 'ISO 8601 date/time including timezone offset' }, duration_minutes: { type: 'integer', minimum: 30, maximum: 240 } }, required: ['booking_time', 'party_size'], additionalProperties: false } },
   { name: 'request_order_cancel', description: 'Cancel only within the first 5 minutes after verifying both order reference and customer phone. After 5 minutes cancellation is never allowed; do not create a replacement order from a cancellation request.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
@@ -2537,7 +2777,7 @@ const TOOL_CATALOG = [
   { name: 'request_order_change', description: '0-5 minutes: replace the complete order after customer confirmation. 5-20 minutes: only add items to the existing bill after confirmation; no cancellation or removals. After 20 minutes: original bill is locked; offer a separate linked order delivered with the original.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' }, requested_changes: { type: 'string' }, items: { type: 'array', items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, customer_confirmed: { type: 'boolean' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'requested_changes'], additionalProperties: false } },
   { name: 'check_order_status', description: 'Look up an order after matching its reference and customer phone.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
   { name: 'get_business_hours', description: 'Return business hours, time zone and reservation cutoff.', parameters: { type: 'object', properties: {}, required: [], additionalProperties: false } },
-  { name: 'calculate_order', description: 'Calculate a price estimate from active D1 menu items without submitting an order.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } } }, required: ['items'], additionalProperties: false } },
+  { name: 'calculate_order_tool', description: 'Calculate a price estimate from active D1 menu items without submitting an order.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } } }, required: ['items'], additionalProperties: false } },
   { name: 'get_menu', description: 'Return active Alex Pizza menu items and prices.', parameters: { type: 'object', properties: {}, required: [], additionalProperties: false } }
 ];
 // end_outbound_call is a Vapi-native call-control action, not a Worker HTTP tool. Configure it separately in Vapi.
