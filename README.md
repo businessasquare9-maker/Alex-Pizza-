@@ -11,8 +11,10 @@ Cloudflare Workers Builds should be connected to this repository with:
 | Repository | `businessasquare9-maker/Alex-Pizza-` |
 | Production branch | `main` |
 | Root directory | `/` |
-| Build command | `node verify-build.mjs` |
+| Build command (recommended verification gate) | `node verify-build.mjs` |
 | Deploy command | `npx wrangler deploy` |
+
+The Build command is optional for this plain JavaScript Worker. If it remains blank in the Cloudflare dashboard, Workers Builds still runs the Deploy command on every production-branch push, but skips this repository's pre-deploy verification script. To make verification automatic, set the Build command to `node verify-build.mjs` in **Settings → Builds**.
 | Worker name | `calling-agent-api` |
 
 A commit pushed to `main` triggers the connected Workers Builds production pipeline. The Git commit SHA and Cloudflare Deployment ID are different identifiers. The actual Active Deployment and Build log are visible in the Cloudflare Worker Deployments / build history page.
