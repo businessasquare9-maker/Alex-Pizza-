@@ -1,53 +1,131 @@
-# Alex Pizza Worker — Staging Candidate
+# Alex Pizza NYC — Production AI Calling Agent
 
-یہ build **ابھی staging candidate ہے**۔ GitHub production branch یا Cloudflare Worker پر commit/deploy نہیں کیا گیا۔
+یہ repository نیویارک کے **Alex Pizza** AI Calling Agent کا production source code ہے۔ Cloudflare Worker کا اصل نام **`calling-agent-api`** ہے۔ D1 میں tenant-scoped data محفوظ ہوتا ہے اور چار Cloudflare Workflows orders، bookings، notifications اور call-minute metering سنبھالتے ہیں۔
 
-## Files اور Cloudflare resources
-- `src/index.js` — Cloudflare Worker اور `OrderProcessingWorkflow`
-- `wrangler.toml` — D1 اور Workflow binding
-- Worker: `alex-pizza-voice-agent`
+## Automatic deployment — Cloudflare Workers Builds
+
+Cloudflare Workers Builds میں یہ values استعمال ہوں:
+
+| Setting | Value |
+|---|---|
+| GitHub repository | `businessasquare9-maker/Alex-Pizza-` |
+| Production branch | `main` |
+| Root directory | `/` |
+| Build command | `node verify-build.mjs` |
+| Deploy command | `npx wrangler deploy` |
+| Worker | `calling-agent-api` |
+
+جب GitHub کی `main` branch میں commit push ہوتا ہے تو منسلک Workers Builds production pipeline شروع کرتی ہے۔ Git commit SHA اور Cloudflare Deployment ID الگ چیزیں ہیں۔ اصل Active Deployment اور build logs Cloudflare Worker کے Deployments / build history میں ہوتے ہیں۔
+
+## Cloudflare resources
+
+- Worker: `calling-agent-api`
 - D1 binding: `DB`
 - D1 database: `calling-agent-db`
-- D1 database ID: `c721e81a-0c7a-47f3-bc47-eabe38f2bcb2`
-- Workflow binding: `ORDER_WORKFLOW`
-- Workflow name: `alex-pizza-order-processing`
-- Workflow class: `OrderProcessingWorkflow`
+- Order Workflow: `ORDER_WORKFLOW` → `alex-pizza-order-processing`
+- Call usage Workflow: `CALL_USAGE_WORKFLOW` → `alex-pizza-live-call-usage`
+- Notification Workflow: `NOTIFICATION_WORKFLOW` → `alex-pizza-notification-delivery`
+- Booking Workflow: `BOOKING_CALENDAR_WORKFLOW` → `alex-pizza-booking-calendar-sync`
+- روزانہ maintenance cron: `17 10 * * *` UTC
 
-## Vapi tools اور endpoints
+تمام secrets اور runtime credentials Cloudflare میں ہی رہیں؛ GitHub source میں hard-code نہ کریں۔
+
+## Vapi کے 13 tools
+
+Worker کے 12 custom HTTP tools:
+
+`send_booking_notification`, `transfer_to_manager`, `request_manager_status_check`, `book_table`, `check_table_availability`, `request_order_cancel`, `submit_order`, `request_order_change`, `check_order_status`, `get_business_hours`, `calculate_order_tool`, `get_menu`.
+
+تیرہواں `end_outbound_call` Vapi کا native call-control tool ہے؛ اسے Vapi میں الگ configure کیا جاتا ہے، Worker HTTP handler نہیں ہے۔
+
+Vapi endpoints:
+
 - `POST /vapi/alex-pizza/tools`
 - `GET /vapi/alex-pizza/tools`
-- `POST /vapi/alex-pizza/events` — Vapi `end-of-call-report`
-- 12 Worker HTTP tools موجودہ ناموں کے ساتھ رجسٹر ہیں؛ `end_outbound_call` Vapi کا native call-control tool ہے اور اسے Vapi میں الگ configure کرنا ہوگا۔
-- `transfer_to_manager` صرف customer complaint/human assistance کے لیے استعمال کریں۔ یہ Worker manager task/alert بناتا ہے؛ خود live call transfer ہونے کا دعویٰ نہیں کرتا۔
+- `POST /vapi/alex-pizza/events`
 
-## تصدیق شدہ کاروباری اصول
-- کاروباری اوقات: **12:00 PM سے 2:00 AM، America/New_York**؛ midnight عبور کرنے کا time check شامل ہے۔ اگر Cloudflare Variables میں `OPEN_HOUR` یا `CLOSE_HOUR` موجود ہوں تو ان کی values بالترتیب `12` اور `2` رکھیں۔
-- Reservations: 10 tables، ہر table پر 4 seats، مجموعی حد 40 seats۔ Party size کے مطابق table-equivalent capacity بھی check ہوتی ہے۔ D1 میں final insert ایک ہی conditional SQL statement کے ذریعے دوبارہ seat/table capacity check کرتا ہے، تاکہ concurrent Worker requests local D1 bookings کی حد cross نہ کریں؛ Google Calendar کی external bookings پہلے availability check میں شامل ہوتی ہیں۔
-- پہلے 5 منٹ میں cancellation موجودہ Worker order کو cancelled نشان زد کرتی ہے۔ اگر Zoho/kitchen کو order پہلے پہنچ چکا ہو تو manager کو فوری manual stop/reconciliation alert جاتا ہے؛ Worker خود Zoho Sales Order cancellation نہیں کرتا۔
-- پہلے 5 منٹ میں change کے لیے مکمل revised `items` array، نیا calculated total، اور `customer_confirmed: true` لازم ہے۔ Worker D1 order update کرتا ہے اور manager کو alert کرتا ہے؛ اگر order پہلے ہی Zoho POS میں جا چکا ہو تو POS copy خودکار طور پر update نہیں ہوتی۔
-- 5 منٹ کے بعد اصل order کبھی modify یا cancel نہیں ہوتا۔ AI صارف سے پوچھتا ہے کہ کیا الگ نیا order اصل order کے ساتھ deliver/pickup کروانا ہے۔ YES پر الگ unique bill/reference بنتا ہے اور `related_order_id`، `delivery_batch_id` اور دستیاب ہو تو `scheduled_delivery_at` سے دونوں link ہوتے ہیں؛ delivery کے لیے اصل address دوبارہ استعمال ہوتا ہے۔ Zoho کو combined-order note بھیجا جاتا ہے، مگر چونکہ POS میں دو الگ sales orders رہتے ہیں، kitchen/dispatch کو دونوں کو ایک ہی physical delivery/pickup batch میں handle کرنا ہوگا۔ NO پر اصل order برقرار رہتا ہے اور manager/dashboard awareness task بنتا ہے؛ manager approval یا live transfer نہیں ہوتا۔
-- ہر order status/change/cancel کے لیے order reference اور matching customer phone verify ہوتا ہے۔ New order صرف customer کی explicit confirmation کے بعد submit ہوتا ہے۔
-- Repeat caller alert 30 منٹ کی window میں deduplicate ہوتا ہے۔
-- Call minutes صرف Vapi `end-of-call-report` سے record ہوتے ہیں؛ فی call duration اگلے پورے minute تک round ہوتی ہے اور billing month New York timezone میں بنتا ہے۔
-- Operational data کے لیے 60-day scheduled purge ہے؛ invoices، payments اور monthly usage محفوظ رہتے ہیں۔
+## کاروباری اوقات اور booking
 
-## موجودہ D1 menu کا تحفظ
-- D1 menu ہی source of truth ہے۔ Code میں کوئی hard-coded sample menu باقی نہیں رکھا گیا اور menu sync endpoint destructive نہیں ہے۔
-- موجودہ `price_cents` values کو dollars میں convert کرکے پڑھا جاتا ہے؛ `size` اور `flavor` بھی واپس کیے جاتے ہیں۔
-- Zoho item IDs کے لیے `ZOHO_ITEM_ID_MAP` JSON variable یا D1 `menu_items.pos_variant_id` استعمال ہوگا۔ موجودہ menu rows کے `pos_variant_id` خالی ہیں، اس لیے ان 16 SKUs کے حقیقی Zoho item IDs map کیے بغیر Zoho POS sync مکمل نہیں ہوگا۔ IDs خود سے generate نہیں کیے جا سکتے۔
+- Time zone: `America/New_York`
+- اوقات: **دوپہر 12 بجے سے رات 2 بجے تک**، midnight crossing کے ساتھ۔
+- Closing سے 20 منٹ پہلے نئے orders اور reservations بند۔
+- 10 tables × 4 seats = 40 seats زیادہ سے زیادہ۔
+- Booking capacity میں D1 reservations اور Google Calendar کی external reservations شامل ہوتی ہیں؛ آخری D1 insert دوبارہ capacity check کرتا ہے۔
+- ایک ہی customer کی 30 منٹ کے اندر repeat call پر alert بنتا ہے، اور اسی window کے duplicate alerts روک دیے جاتے ہیں۔
 
-## Admin اور manager dashboard
-تمام admin routes کو موجودہ admin bearer token اور POST method درکار ہے:
-- `/admin/bootstrap` — D1 schema اور additive columns
-- `/admin/tenant-status` — tenant کو `active` یا `suspended` کرنا
-- `/admin/invoice`، `/admin/manual-payment`، `/admin/usage`
-- `/admin/zoho-token`، `/admin/google-calendar-test`
-- `/manager` — dashboard UI
-- `/manager/data?tenant_id=alex-pizza` اور `/manager/export?tenant_id=alex-pizza` — manager token کے ساتھ tenant-scoped records
+## Order policy
 
-`MANAGER_DASHBOARD_TOKEN` الگ Cloudflare Secret کے طور پر درکار ہے۔ اسے Vapi یا Admin token کے طور پر reuse نہ کریں۔ Invoice میں `due_at` دیا ہو تو روزانہ cron due date گزرنے اور invoice `unpaid`/`partially_paid` رہنے پر tenant کو خودکار suspend کرتا ہے۔ `due_at` خالی ہو تو auto-suspension نہیں ہوتی۔ ادائیگی کے بعد admin `/admin/tenant-status` سے tenant کو دوبارہ `active` کر سکتا ہے؛ خودکار reactivation نہیں کی جاتی۔
+| آرڈر کی عمر | اجازت |
+|---|---|
+| 0–5 منٹ | Customer کی واضح confirmation کے بعد مکمل change یا cancellation |
+| 5 منٹ سے زیادہ، 20 منٹ تک | صرف نئے items اصل bill میں add؛ cancellation، item removal یا مکمل replacement نہیں |
+| 20 منٹ سے زیادہ | اصل bill مکمل lock؛ customer کی رضامندی پر الگ linked bill بنایا جا سکتا ہے |
 
-## Deployment safety
-- Secrets/credentials source میں hard-code نہیں کیے گئے۔ `keep_vars = true` موجودہ dashboard variables کو Wrangler deploy کے دوران preserve کرنے کے لیے ہے۔
-- Worker code syntax check اور local smoke checks پاس کر چکا ہے۔ حقیقی Cloudflare D1، Workflow، SignalWire، Google Calendar، Zoho POS، Vapi اور concurrent booking end-to-end tests ابھی نہیں ہوئے۔
-- Build deploy کرنے سے پہلے `MANAGER_DASHBOARD_TOKEN`، Zoho item mapping، Workflow binding اور تمام existing runtime bindings verify کریں۔ کوئی secret GitHub میں commit نہ کریں۔
+ہر bill کی 8-character reference ہوتی ہے۔ Status، change اور cancellation کے لیے order reference اور customer phone دونوں verify ہوتے ہیں۔ ہر bill tenant کے اندر D1 میں الگ محفوظ ہوتا ہے۔
+
+## Order، Zoho POS اور notifications
+
+1. Customer order کی واضح confirmation دیتا ہے۔
+2. Worker bill اور order items کو D1 میں محفوظ کرتا ہے۔
+3. Customer receipt اور manager notification کی dispatch کوشش Zoho POS کے نتیجے کا انتظار کیے بغیر ہوتی ہے۔
+4. SignalWire delivery record D1 میں بنتا ہے اور `NOTIFICATION_WORKFLOW` ناکام notifications کو retry کرتا ہے۔
+5. `ORDER_WORKFLOW` Zoho Sales Order create یا update کرتا ہے اور اسے Confirmed کرنے کی کوشش کرتا ہے۔
+6. ایک bill کے لیے D1 POS lease lock لگتا ہے؛ initial order اور subsequent edits/additions الگ الگ duplicate Zoho bills نہیں بناتے۔ ہر workflow lock لینے کے بعد D1 سے تازہ bill دوبارہ load کرتا ہے۔
+7. پہلے پانچ منٹ میں cancellation پر اگر Zoho Sales Order پہلے بن چکا ہو تو اسے Void کرنے کی کوشش ہوتی ہے۔
+
+Zoho POS failure customer کے confirmed D1 order، customer receipt یا manager notification کو delete/reject نہیں کرتا؛ POS status الگ محفوظ رہتا ہے۔
+
+## D1 Menu اور Zoho mapping
+
+D1 `menu_items` اصل menu source of truth ہے۔ Worker ان کالمز کو پڑھتا ہے:
+
+`tenant_id, sku, name, category, size, flavor, price_cents, active, pos_variant_id`.
+
+Menu sync destructive نہیں؛ existing rows delete یا reseed نہیں ہوتیں۔ Legacy `price` کو additive migration کے ذریعے `price_cents` میں convert کیا جاتا ہے۔
+
+اگر `pos_variant_id` خالی ہو تو Worker Zoho POS item list سے exact SKU match تلاش کرتا ہے۔ Mapping صرف تب محفوظ ہوتی ہے جب:
+- SKU exact اور unique ہو،
+- Zoho item active/sellable ہو،
+- D1 `price_cents` اور Zoho rate cents برابر ہوں،
+- پہلے سے موجود ID کا conflict نہ ہو۔
+
+Duplicate SKU، disabled item، price difference یا conflicting ID کو خود سے guess نہیں کیا جاتا۔ CSV reconciliation template repository میں شامل ہے۔
+
+Zoho POS OAuth scopes:
+- `ZohoPOSAPI.items.READ`
+- `ZohoPOSAPI.salesorders.CREATE`
+- `ZohoPOSAPI.salesorders.UPDATE`
+
+## Manager status call اور complaint transfer
+
+Order-status سوال پر AI پہلے phone اور bill reference verify کرتا ہے، customer کو hold پر رکھتا ہے، Vapi کے configured manager assistant سے outbound call کرتا ہے، manager کا جواب محفوظ کرتا ہے اور اسی inbound customer call پر factual status واپس سناتا ہے۔ AI status خود سے نہیں بناتا۔
+
+Live transfer صرف explicit complaint پر ہے۔ Live Vapi control URL ملنے پر transfer command جاتا ہے؛ ورنہ manager callback task اور notification بنتی ہے۔ AI manager کے answer کیے بغیر transfer کامیاب ہونے کا دعویٰ نہیں کرتا۔
+
+## Usage، retention اور tenant controls
+
+- `CALL_USAGE_WORKFLOW` active calls کے دوران ہر منٹ usage tick کرتا ہے؛ Vapi end-of-call report final duration reconcile کرتا ہے۔
+- Usage New York calendar month کے حساب سے محفوظ ہوتا ہے؛ ہر نئے مہینے کے پہلے New York دن پچھلا month archive ہوتا ہے۔
+- Operational records 60 دن rolling retention میں رہتے ہیں۔ 61ویں دن پہلا دن حذف ہوتا ہے، 62ویں دن دوسرا دن، اسی طرح۔ Invoices، payments، tenants اور monthly usage history برقرار رہتی ہے۔
+- Client dashboard token hashed صورت میں D1 میں محفوظ ہوتا ہے؛ client صرف اپنے tenant کا data دیکھتا ہے۔
+- Provider admin تمام clients کا overview دیکھ سکتا ہے، invoices/payments record کر سکتا ہے، اور tenant کو activate/suspend کر سکتا ہے۔
+- Due date کے بعد unpaid/partially-paid invoice tenant کو خودکار suspend کر سکتی ہے؛ payment کے بعد provider admin اسے دوبارہ activate کرتا ہے۔
+
+## Dashboard APIs
+
+- Manager UI: `GET /manager`
+- Manager data/export: `GET /manager/data`, `GET /manager/export`
+- Client data/export: `GET /client/data`, `GET /client/export` — tenant صرف dashboard token سے identify ہوتا ہے۔
+- Provider overview/control: protected `POST /admin/*` routes۔
+
+Worker میں dashboard data/API اور tenant controls موجود ہیں؛ موجودہ `/manager` ایک basic operational viewer ہے۔ آپ کی planned animated client/provider dashboard UI الگ frontend کے طور پر بنائی جا سکتی ہے اور ان APIs سے data لے سکتی ہے۔
+
+## Build verification
+
+`verify-build.mjs` Worker module import/syntax، New York hours، Vapi tool names، D1 cents/menu compatibility، booking capacity، order policy، چاروں Workflows، bill-level POS lock، manager calls/transfers، tenant isolation، retention اور Zoho sync paths کو check کرتا ہے۔
+
+```bash
+node verify-build.mjs
+```
+
+D1 کے read-only inspection queries `D1_PREDEPLOY_CHECKS.sql` میں ہیں۔
