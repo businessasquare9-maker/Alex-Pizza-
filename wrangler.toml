@@ -1,0 +1,18 @@
+name = "alex-pizza-voice-agent"
+main = "src/index.js"
+compatibility_date = "2026-11-02"
+workers_dev = true
+keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "calling-agent-db"
+database_id = "c721e81a-0c7a-47f3-bc47-eabe38f2bcb2"
+
+[[workflows]]
+binding = "ORDER_WORKFLOW"
+name = "alex-pizza-order-processing"
+class_name = "OrderProcessingWorkflow"
+
+[triggers]
+crons = ["17 3 * * *"]
