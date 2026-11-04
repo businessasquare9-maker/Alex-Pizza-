@@ -2021,9 +2021,7 @@ async function submitOrder(env, tenantId, args, ctx) {
     throw new AppError('Alex Pizza is not accepting new orders at this time. ' + orderHours.reason,
       'ordering_closed', 409, { time_zone: businessConfig(env).timeZone, cutoff_minutes: businessConfig(env).cutoffMinutes });
   }
-  if (!env.ORDER_WORKFLOW || typeof env.ORDER_WORKFLOW.create !== 'function') {
-    throw new AppError('Order processing Workflow binding ORDER_WORKFLOW is missing; order was not created.', 'workflow_binding_missing', 503);
-  }
+  // A missing/failed Workflow must never discard a customer-confirmed order; persist and dispatch it first.
   if (args.customer_confirmed !== true) throw new AppError('Customer confirmation is required before submitting an order.', 'customer_confirmation_required', 400);
   const customerPhone = customerPhoneFrom(args, true);
   let relatedOrder = null;
