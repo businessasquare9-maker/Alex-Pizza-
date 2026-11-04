@@ -2651,9 +2651,27 @@ async function recordInboundCallStart(env, tenantId, call) {
   const callId = clean(call?.id || '', 120);
   if (!callId) return { recorded: false, reason: 'missing_call_id' };
   const existing = await env.DB.prepare(
-    'SELECT 1 FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+    'SELECT `status`, `direction` FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
   ).bind(tenantId, callId).first();
-  if (existing) return { recorded: false, duplicate: true, call_id: callId };
+  if (existing) {
+    // Repeated Vapi in-progress webhook can safely recover a missed Workflow start.
+    if (norm(existing.status) === 'in_progress' && env.CALL_USAGE_WORKFLOW && typeof env.CALL_USAGE_WORKFLOW.create === 'function') {
+      try {
+        await env.CALL_USAGE_WORKFLOW.create({
+          id: 'call-usage-' + callId,
+          params: { tenant_id: tenantId, call_id: callId }
+        });
+      } catch (err) {
+        const message = norm(err?.message || '');
+        if (!/already exists|duplicate|conflict|instance exists/.test(message)) {
+          await recordIntegrationStatus(env, tenantId, 'call_usage_workflow', 'start_failed', {
+            call_id: callId, code: clean(err?.code || 'call_usage_workflow_failed', 80)
+          });
+        }
+      }
+    }
+    return { recorded: false, duplicate: true, call_id: callId };
+  }
 
   const callType = clean(call?.type || 'inboundPhoneCall', 40);
   const direction = norm(callType).includes('outbound') ? 'outbound' : 'inbound';
