@@ -556,6 +556,7 @@ async function ensureSchema(env) {
       'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT'
     ]) { try { await env.DB.prepare(migration).run(); } catch {} }
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tool_call` ON `orders` (`tenant_id`, `tool_call_id`)').run(); } catch {}
+    try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_orders_tenant_order_id` ON `orders` (`tenant_id`, `order_id`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_calls_tenant_call_id` ON `calls` (`tenant_id`, `call_id`)').run(); } catch {}
     columnCache.clear();
     return { tablesChecked };
@@ -1493,7 +1494,7 @@ function buildReceiptText(order) {
     'Customer: ' + clean(order.customer_name || 'Guest', 120),
     'Phone: ' + clean(order.customerPhone || order.customer_phone || 'not stored', 40),
     'Type: ' + order.order_type,
-    ...order.items.map(item => item.quantity + ' x ' + item.name + ' @ ' + money(item.unit_price) + ' = ' + money(item.line_total)),
+    ...order.items.map(item => item.quantity + ' x ' + item.name + ' @ ' + money(item.unit_price ?? item.unitPrice) + ' = ' + money(item.line_total ?? item.lineTotal)),
     'Total: ' + money(order.total) + ' ' + order.currency
   ];
   if (order.related_order_id) lines.push('Deliver together with original order: ' + order.related_order_id);
@@ -1893,7 +1894,7 @@ async function loadPricedItems(env, tenantId, rawItems, argsTotal) {
   });
 }
 async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, resolvedCustomerPhone) {
-  const orderId = 'ORD-' + makeId(8);
+  const orderId = makeId(8);
   const total = roundMoney(pricedItems.reduce((sum, item) => sum + item.lineTotal, 0));
   const customerPhone = resolvedCustomerPhone === undefined
     ? customerPhoneFrom(args, true)
