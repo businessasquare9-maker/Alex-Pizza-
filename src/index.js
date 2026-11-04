@@ -2902,11 +2902,12 @@ async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
       message_for_assistant: 'The manager has supplied this status for this call. Tell the customer the manager-reported status clearly. Do not transfer the customer.'
     };
   }
-  if (existing && ['initiating', 'calling_manager', 'queued', 'in-progress'].includes(norm(existing.status))) {
+  if (existing && ['initiating', 'calling_manager', 'queued', 'in-progress'].includes(norm(existing.status)) &&
+      clean(existing.inbound_call_id || '', 120) === clean(context.callId || '', 120)) {
     return {
       ok: true, order_reference: orderId, current_system_status: orderStatus.status,
       manager_call_status: existing.status, status: 'waiting_for_manager',
-      message_for_assistant: 'The manager call is still in progress. Tell the customer you are checking with the manager and ask them to hold. Call request_manager_status_check again with the same order reference and customer phone after a short pause. Do not invent a status and do not transfer the customer.'
+      message_for_assistant: 'The manager call is still in progress. The customer has been asked to hold. The manager reply will be spoken automatically into this same call when the manager call ends. Do not redial the manager, do not invent a status, and do not transfer the customer.'
     };
   }
   if (existing && ['no_manager_response', 'call_start_failed'].includes(norm(existing.status)) &&
@@ -2926,6 +2927,7 @@ async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
     [['customer_phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? phone : null],
     [['caller_hash'], callerRef], [['manager_phone'], managerPhone],
     [['inbound_call_id'], clean(context.callId || '', 120)],
+    [['inbound_control_url'], clean(context.controlUrl || '', 1000)],
     [['status'], 'initiating'], [['started_at'], nowIso()], [['created_at'], nowIso()], [['updated_at'], nowIso()]
   ]);
   // Keep the customer informed while the outbound manager check runs.
@@ -2952,7 +2954,7 @@ async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
     return {
       ok: true, order_reference: orderId, current_system_status: orderStatus.status,
       manager_call_status: managerCall.status, status: 'manager_call_started',
-      message_for_assistant: 'You have called the manager. Tell the customer you are checking and ask them to hold. Invoke request_manager_status_check again with the same order_reference and customer_phone after a short pause to retrieve the manager response. Never state a guessed order status and never transfer the customer for a routine status check.'
+      message_for_assistant: 'You have called the manager. The customer has been asked to hold. When the manager call ends, the manager response will be spoken automatically into the same waiting customer call. Do not redial the manager, do not invent a status and do not transfer the customer for a routine status check.'
     };
   } catch (err) {
     await env.DB.prepare(
@@ -3259,7 +3261,10 @@ async function collectManagerData(env, tenantId) {
     const createdColumn = findColumn(columns, ['created_at', 'createdAt', 'created']);
     if (!tenantColumn || !createdColumn) { data[table] = []; continue; }
     const result = await env.DB.prepare(`SELECT * FROM ${q(table)} WHERE ${q(tenantColumn)} = ? AND ${q(createdColumn)} >= ? ORDER BY ${q(createdColumn)} DESC LIMIT 5000`).bind(tenantId, cutoff).all();
-    data[table] = result.results || [];
+    const rows = result.results || [];
+    data[table] = table === 'manager_status_checks'
+      ? rows.map(({ inbound_control_url, ...safeRow }) => safeRow)
+      : rows;
     recordCount += data[table].length;
   }
   const usage = await env.DB.prepare('SELECT `month`, `total_minutes`, `last_call_at`, `status`, `updated_at` FROM `monthly_call_usage` WHERE `tenant_id` = ? ORDER BY `month` DESC LIMIT 24').bind(tenantId).all();
