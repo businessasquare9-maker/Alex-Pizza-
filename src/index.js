@@ -1861,26 +1861,30 @@ async function buildZohoMenuMappingReport(env, tenantId) {
       zoho_item_id: id, zoho_status: clean(item.status || 'unknown', 40),
       status: 'zoho_item_not_active_or_not_sellable', mapped: false
     };
-    if (!Number.isFinite(remoteCents) || remoteCents !== expectedCents) return {
-      sku, name: clean(row.name, 180), price_cents: expectedCents,
-      zoho_item_id: id, zoho_rate_cents: Number.isFinite(remoteCents) ? remoteCents : null,
-      status: 'price_mismatch', mapped: false
-    };
+    const priceMatches = Number.isFinite(remoteCents) && remoteCents === expectedCents;
     if (currentId && currentId !== id) return {
       sku, name: clean(row.name, 180), price_cents: expectedCents,
       existing_pos_variant_id: currentId, zoho_item_id: id,
+      zoho_rate_cents: Number.isFinite(remoteCents) ? remoteCents : null,
       status: 'existing_mapping_conflict', mapped: false
     };
     return {
       sku, name: clean(row.name, 180), price_cents: expectedCents,
-      zoho_item_id: id, zoho_name: clean(item.name, 180), zoho_rate_cents: remoteCents,
-      status: currentId === id ? 'already_mapped_exact_match' : 'exact_match_ready',
+      zoho_item_id: id, zoho_name: clean(item.name, 180),
+      zoho_rate_cents: Number.isFinite(remoteCents) ? remoteCents : null,
+      price_matches: priceMatches,
+      price_override_required: !priceMatches,
+      status: currentId === id
+        ? (priceMatches ? 'already_mapped_exact_match' : 'already_mapped_price_override')
+        : (priceMatches ? 'exact_match_ready' : 'sku_match_price_override'),
       mapped: true
     };
   });
   return {
     tenant_id: tenantId, local_menu_count: rows.length, zoho_items_scanned: remoteItems.length,
-    exact_matches: rows.filter(row => row.mapped).length,
+    exact_matches: rows.filter(row => row.mapped && row.price_matches).length,
+    sku_mapped: rows.filter(row => row.mapped).length,
+    price_override_items: rows.filter(row => row.mapped && row.price_override_required).length,
     needs_attention: rows.filter(row => !row.mapped).length, rows
   };
 }
@@ -1892,7 +1896,7 @@ async function applyZohoMenuMapping(env, tenantId, report) {
   const posColumn = findColumn(columns, ['pos_variant_id', 'zoho_item_id', 'pos_item_id']);
   const updates = [];
   for (const row of report.rows) {
-    if (row.status !== 'exact_match_ready' || !row.zoho_item_id) continue;
+    if (!['exact_match_ready', 'sku_match_price_override'].includes(row.status) || !row.zoho_item_id) continue;
     updates.push(env.DB.prepare(
       'UPDATE "menu_items" SET ' + q(posColumn) + ' = ? WHERE ' + q(scopeColumn) +
       ' = ? AND LOWER(' + q(skuColumn) + ') = LOWER(?) AND (' + q(posColumn) + ' IS NULL OR ' + q(posColumn) + ' = ?)'
@@ -1996,6 +2000,8 @@ async function pushOrderToZoho(env, tenantId, order) {
       missingSkus = order.items.filter(item => !itemIdFor(item.sku)).map(item => item.sku);
       await recordIntegrationStatus(env, tenantId, 'zoho_pos', 'automatic_sku_mapping_attempted', {
         order_id: order.order_id, exact_matches: mappingReport.exact_matches,
+        sku_mapped: mappingReport.sku_mapped,
+        price_override_skus: mappingReport.rows.filter(row => row.price_override_required).map(row => row.sku),
         needs_attention: mappingReport.needs_attention, remaining_missing_skus: missingSkus
       });
     } catch (err) {
