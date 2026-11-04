@@ -565,13 +565,10 @@ async function ensureSchema(env) {
       'ALTER TABLE `menu_items` ADD COLUMN `pos_variant_id` TEXT',
       'ALTER TABLE `invoices` ADD COLUMN `due_at` TEXT',
       'ALTER TABLE `calls` ADD COLUMN `duration_seconds` INTEGER',
-      'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER',
+      'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT',
       'ALTER TABLE `calls` ADD COLUMN `started_at` TEXT',
-      'ALTER TABLE `calls` ADD COLUMN `status` TEXT',
-      'ALTER TABLE `calls` ADD COLUMN `duration_seconds` INTEGER',
-      'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT'
+      'ALTER TABLE `calls` ADD COLUMN `status` TEXT'
     ]) { try { await env.DB.prepare(migration).run(); } catch {} }
     // Preserve legacy dollar-denominated menu prices when adding the cents column.
     try {
