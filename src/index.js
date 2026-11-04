@@ -90,7 +90,9 @@ const ENV_KEYS = {
   allowManualTotal: ['ALLOW_MANUAL_TOTAL'],
   vapiApiKey: ['VAPI_PRIVATE_API_KEY', 'VAPI_API_KEY', 'VAPI_TOKEN'],
   vapiAssistantId: ['VAPI_MANAGER_ASSISTANT_ID', 'VAPI_ASSISTANT_ID'],
-  vapiPhoneNumberId: ['VAPI_PHONE_NUMBER_ID']
+  vapiPhoneNumberId: ['VAPI_PHONE_NUMBER_ID'],
+  vapiPublicApiKey: ['VAPI_PUBLIC_API_KEY'],
+  vapiControlAuth: ['VAPI_CONTROL_AUTHENTICATION_ENABLED']
 };
 
 const PHONE_KEY_HINT = /phone|whatsapp|mobile|sms|number|contact|recipient|msisdn|e164/i;
@@ -457,6 +459,16 @@ async function requireToolAuth(request, env) {
       }
     );
   }
+}
+
+function vapiControlHeaders(env) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (envFlag(env, ENV_KEYS.vapiControlAuth, false)) {
+    const publicKey = envValue(env, ENV_KEYS.vapiPublicApiKey);
+    if (!publicKey) throw new AppError('VAPI_PUBLIC_API_KEY is required because Vapi live call control authentication is enabled.', 'vapi_control_auth_key_missing', 503);
+    headers.Authorization = 'Bearer ' + publicKey;
+  }
+  return headers;
 }
 
 async function requireAdminAuth(request, env) {
@@ -2677,7 +2689,7 @@ async function transferToManager(env, tenantId, args, context = {}) {
   }
   const response = await fetchWithTimeout(parsed.toString(), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: vapiControlHeaders(env),
     body: JSON.stringify({
       type: 'transfer',
       destination: { type: 'number', number: managerPhone },
@@ -2746,7 +2758,7 @@ async function requestManagerStatusCheck(env, tenantId, args, context = {}) {
       const u = new URL(context.controlUrl);
       if (u.protocol === 'https:' && u.hostname.endsWith('.vapi.ai') && u.pathname.endsWith('/control')) {
         await fetchWithTimeout(u.toString(), {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: vapiControlHeaders(env),
           body: JSON.stringify({ type: 'say', content: 'Please hold for a moment while I contact the manager to verify your order status.', endCallAfterSpoken: false })
         }, 4000);
       }
@@ -2857,7 +2869,7 @@ const TOOL_CATALOG = [
   { name: 'request_manager_status_check', description: 'Verify order reference and customer phone. The Worker calls the manager using Vapi outbound calling, keeps the customer with the AI, and stores the manager reply from the Vapi call-end webhook. Call this function again with the same details to retrieve the reply; never invent a status.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
   { name: 'book_table', description: 'Create a table reservation after checking availability and calendar synchronization.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40 }, booking_time: { type: 'string' }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, duration_minutes: { type: 'integer' } }, required: ['customer_name', 'customer_phone', 'booking_time', 'party_size'], additionalProperties: false } },
   { name: 'check_table_availability', description: 'Check reservation availability in America/New_York business time.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40, description: 'Number of guests; restaurant capacity is 40 seats across 10 four-seat tables.' }, booking_time: { type: 'string', description: 'ISO 8601 date/time including timezone offset' }, duration_minutes: { type: 'integer', minimum: 30, maximum: 240 } }, required: ['booking_time', 'party_size'], additionalProperties: false } },
-  { name: 'request_order_cancel', description: 'Cancel only within the first 5 minutes after verifying both order reference and customer phone. After 5 minutes cancellation is never allowed; do not create a replacement order from a cancellation request.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
+  { name: 'request_order_cancel', description: 'Cancel only within the first 5 minutes after verifying both order reference and customer phone. After 5 minutes cancellation is never allowed; do not create a replacement order from a cancellation request.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
   { name: 'submit_order', description: 'Submit customer-confirmed pickup or delivery order. POS confirmation is asynchronous; report pending until confirmed.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, notes: { type: 'string' }, order_type: { type: 'string', enum: ['pickup', 'delivery'] }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, delivery_address: { type: 'string' }, customer_confirmed: { type: 'boolean' }, related_order_reference: { type: 'string' }, deliver_with_original: { type: 'boolean' } }, required: ['customer_name', 'customer_phone', 'order_type', 'items', 'customer_confirmed'], additionalProperties: false } },
   { name: 'request_order_change', description: '0-5 minutes: replace the complete order after customer confirmation. 5-20 minutes: only add items to the existing bill after confirmation; no cancellation or removals. After 20 minutes: original bill is locked; offer a separate linked order delivered with the original.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' }, requested_changes: { type: 'string' }, items: { type: 'array', items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, customer_confirmed: { type: 'boolean' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'requested_changes'], additionalProperties: false } },
   { name: 'check_order_status', description: 'Verify customer phone and order reference, automatically call the manager for the latest order status, keep the customer with the AI and return the manager reply when available.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
