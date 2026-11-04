@@ -1964,7 +1964,6 @@ async function loadPricedItems(env, tenantId, rawItems, argsTotal) {
   });
 }
 async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, resolvedCustomerPhone) {
-  const orderId = makeId(8);
   const total = roundMoney(pricedItems.reduce((sum, item) => sum + item.lineTotal, 0));
   const customerPhone = resolvedCustomerPhone === undefined
     ? customerPhoneFrom(args, true)
@@ -1977,42 +1976,52 @@ async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, re
   const notes = clean(args.notes || args.special_instructions || '', 1000);
   const createdAt = nowIso();
 
-  const orderInsert = await prepareScopedInsert(env, 'orders', tenantId, [
-    [['id'], orderId], [['order_id'], orderId],
-    [['customer_name', 'name'], customerName],
-    [['customer_phone', 'phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? customerPhone : null],
-    [['caller_hash'], callerRef], [['order_type', 'fulfillment_type'], orderType],
-    [['delivery_address'], clean(args.delivery_address || '', 300) || null],
-    [['related_order_id'], clean(args.__related_order_id || '', 100) || null],
-    [['delivery_batch_id'], clean(args.__delivery_batch_id || '', 100) || null],
-    [['scheduled_delivery_at'], clean(args.__scheduled_delivery_at || '', 80) || null],
-    [['tool_call_id'], clean(args.__tool_call_id || '', 120) || null],
-    [['total', 'total_amount', 'amount'], total], [['currency'], CURRENCY],
-    [['items_json', 'items'], JSON.stringify(pricedItems).slice(0, 8000)],
-    [['status'], 'submitted'], [['notes', 'special_instructions'], notes],
-    [['created_at'], createdAt], [['updated_at'], createdAt]
-  ]);
-
-  const itemInserts = [];
-  for (const item of pricedItems) {
-    const prepared = await prepareScopedInsert(env, 'order_items', tenantId, [
-      [['id'], makeId(16)], [['order_id'], orderId], [['sku'], item.sku],
-      [['name', 'item_name'], item.name], [['category'], item.category],
-      [['unit_price', 'price'], item.unitPrice], [['quantity'], item.quantity],
-      [['line_total'], item.lineTotal], [['created_at'], createdAt]
+  // Exactly eight characters are retained for the customer-facing reference.
+  // A tenant-scoped unique D1 index is the final collision guard; retry a collision.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const orderId = makeId(8);
+    const orderInsert = await prepareScopedInsert(env, 'orders', tenantId, [
+      [['id'], orderId], [['order_id'], orderId],
+      [['customer_name', 'name'], customerName],
+      [['customer_phone', 'phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? customerPhone : null],
+      [['caller_hash'], callerRef], [['order_type', 'fulfillment_type'], orderType],
+      [['delivery_address'], clean(args.delivery_address || '', 300) || null],
+      [['related_order_id'], clean(args.__related_order_id || '', 100) || null],
+      [['delivery_batch_id'], clean(args.__delivery_batch_id || '', 100) || null],
+      [['scheduled_delivery_at'], clean(args.__scheduled_delivery_at || '', 80) || null],
+      [['tool_call_id'], clean(args.__tool_call_id || '', 120) || null],
+      [['total', 'total_amount', 'amount'], total], [['currency'], CURRENCY],
+      [['items_json', 'items'], JSON.stringify(pricedItems).slice(0, 8000)],
+      [['status'], 'submitted'], [['notes', 'special_instructions'], notes],
+      [['created_at'], createdAt], [['updated_at'], createdAt]
     ]);
-    itemInserts.push(prepared.statement);
+    const itemInserts = [];
+    for (const item of pricedItems) {
+      const prepared = await prepareScopedInsert(env, 'order_items', tenantId, [
+        [['id'], makeId(16)], [['order_id'], orderId], [['sku'], item.sku],
+        [['name', 'item_name'], item.name], [['category'], item.category],
+        [['unit_price', 'price'], item.unitPrice], [['quantity'], item.quantity],
+        [['line_total'], item.lineTotal], [['created_at'], createdAt]
+      ]);
+      itemInserts.push(prepared.statement);
+    }
+    try {
+      // D1 batch is transactional: the bill and every line item commit together.
+      await env.DB.batch([orderInsert.statement, ...itemInserts]);
+      return {
+        order_id: orderId, customer_name: customerName, customerPhone,
+        callerRef, order_type: orderType, currency: CURRENCY, total,
+        items: pricedItems, notes, status: 'submitted', createdAt
+      };
+    } catch (err) {
+      const detail = clean(err?.message || err?.cause?.message || '', 300).toLowerCase();
+      const isOrderReferenceCollision = /unique constraint failed/.test(detail) &&
+        (detail.includes('orders.order_id') || detail.includes('orders.id') || detail.includes('orders.tenant_id'));
+      if (isOrderReferenceCollision && attempt < 5) continue;
+      throw err;
+    }
   }
-
-  // D1 batch is a transaction: either the bill and every item row are committed,
-  // or none of them are, preventing partially-created customer bills.
-  await env.DB.batch([orderInsert.statement, ...itemInserts]);
-
-  return {
-    order_id: orderId, customer_name: customerName, customerPhone,
-    callerRef, order_type: orderType, currency: CURRENCY, total,
-    items: pricedItems, notes, status: 'submitted', createdAt
-  };
+  throw new AppError('Could not allocate a unique eight-character bill reference.', 'bill_reference_collision', 503);
 }
 
 async function submitOrder(env, tenantId, args, ctx) {
