@@ -2289,30 +2289,49 @@ async function requestOrderChange(env, tenantId, args) {
     sku: item.sku, name: item.name, category: item.category,
     unit_price: item.unitPrice, quantity: item.quantity, line_total: item.lineTotal
   })));
-  const update = await env.DB.prepare(
+  const original = await env.DB.prepare(
+    'SELECT * FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) LIMIT 1'
+  ).bind(tenantId, orderId, orderId).first();
+  if (!original) throw new AppError('Order not found.', 'order_not_found', 404);
+
+  const stamp = nowIso();
+  const update = env.DB.prepare(
     "UPDATE `orders` SET `items_json` = ?, `total` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `created_at` >= ? AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
-  ).bind(itemsJson, total, nowIso(), tenantId, orderId, orderId, new Date(Date.now() - 5 * 60000).toISOString()).run();
-  if (Number(update.meta?.changes || 0) !== 1) {
-    throw new AppError('The order change window expired while the update was being processed. The original order was not changed.',
+  ).bind(itemsJson, total, stamp, tenantId, orderId, orderId, new Date(Date.now() - 5 * 60000).toISOString());
+  const removeOldItems = env.DB.prepare(
+    'DELETE FROM `order_items` WHERE `tenant_id` = ? AND `order_id` = ? AND EXISTS (SELECT 1 FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `updated_at` = ?)'
+  ).bind(tenantId, orderId, tenantId, orderId, orderId, stamp);
+  const insertNewItems = priced.map(item => env.DB.prepare(
+    'INSERT INTO `order_items` (`tenant_id`, `id`, `order_id`, `sku`, `name`, `category`, `unit_price`, `quantity`, `line_total`, `created_at`) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `updated_at` = ?)'
+  ).bind(tenantId, makeId(16), orderId, item.sku, item.name, item.category, item.unitPrice, item.quantity, item.lineTotal, stamp, tenantId, orderId, orderId, stamp));
+  const batch = await env.DB.batch([update, removeOldItems, ...insertNewItems]);
+  if (Number(batch?.[0]?.meta?.changes || 0) !== 1) {
+    throw new AppError('The 5-minute change window expired or the order is no longer editable. No changes were applied.',
       'change_window_expired', 409);
   }
-  await env.DB.prepare('DELETE FROM `order_items` WHERE `tenant_id` = ? AND `order_id` = ?').bind(tenantId, orderId).run();
-  for (const item of priced) {
-    await insertScoped(env, 'order_items', tenantId, [
-      [['id'], makeId(16)], [['order_id'], orderId], [['sku'], item.sku], [['name', 'item_name'], item.name],
-      [['category'], item.category], [['unit_price', 'price'], item.unitPrice], [['quantity'], item.quantity],
-      [['line_total'], item.lineTotal], [['created_at'], nowIso()]
-    ]);
-  }
-  await audit(env, tenantId, 'order_changed_within_five_minutes', { order_id: orderId, new_total: total, item_count: priced.length });
+  await audit(env, tenantId, 'order_changed_within_five_minutes', {
+    order_id: orderId, new_total: total, item_count: priced.length
+  });
   try {
     await queueRoleNotification(env, tenantId, 'manager',
-      'ORDER UPDATED within 5-minute customer change window: ' + orderId + ', new total ' + money(total),
+      'ORDER UPDATED within the first 5 minutes: ' + orderId + ', new total ' + money(total),
       'order_changed');
   } catch {}
-  return { ok: true, change_applied: true, order_id: orderId, total, currency: CURRENCY,
-    item_count: priced.length, status: 'updated_within_policy',
-    message_for_assistant: 'The revised order is saved in the Worker and the manager was alerted. Do not claim the POS or kitchen copy was changed automatically.' };
+  let updatedReceipt = { status: 'not_sent' };
+  try {
+    updatedReceipt = await dispatchOrderReceipt(env, tenantId, {
+      order_id: orderId, customer_name: original.customer_name || 'Guest', customerPhone: phone,
+      order_type: original.order_type || 'pickup', currency: original.currency || CURRENCY,
+      total, items: priced, notes: original.notes || '',
+      related_order_id: original.related_order_id || null
+    }, phone);
+  } catch (err) {
+    updatedReceipt = { status: 'dispatch_error', error: clean(publicError(err).error, 160) };
+  }
+  return { ok: true, change_applied: true, updated_receipt: updatedReceipt, order_id: orderId,
+    total, currency: CURRENCY, item_count: priced.length, status: 'updated_within_policy',
+    message_for_assistant: 'The complete revised order was saved atomically within the first 5 minutes. The manager and customer receipt dispatch were initiated. Do not claim the POS or kitchen copy was changed automatically.' };
+}
 }
 
 function getBusinessInfo(env) {
