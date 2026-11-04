@@ -528,7 +528,7 @@ const SCHEMA_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS `bookings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `booking_time` TEXT NOT NULL, `duration_minutes` INTEGER NOT NULL DEFAULT 90, `party_size` INTEGER, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `status` TEXT, `started_at` TEXT, `duration_seconds` INTEGER, `billable_minutes` INTEGER NOT NULL DEFAULT 0, `ended_at` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_tasks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `task_id` TEXT, `title` TEXT, `description` TEXT, `priority` TEXT, `status` TEXT, `caller_hash` TEXT, `dedupe_key` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `manager_status_checks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_reference` TEXT NOT NULL, `customer_phone` TEXT, `caller_hash` TEXT, `manager_phone` TEXT, `inbound_call_id` TEXT, `outbound_call_id` TEXT, `status` TEXT, `manager_response` TEXT, `started_at` TEXT, `completed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `manager_status_checks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_reference` TEXT NOT NULL, `customer_phone` TEXT, `caller_hash` TEXT, `manager_phone` TEXT, `inbound_call_id` TEXT, `inbound_control_url` TEXT, `outbound_call_id` TEXT, `status` TEXT, `manager_response` TEXT, `callback_status` TEXT, `callback_sent_at` TEXT, `started_at` TEXT, `completed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `call_usage_ticks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT NOT NULL, `minute_index` INTEGER NOT NULL, `month` TEXT NOT NULL, `counted_at` TEXT NOT NULL, `created_at` TEXT NOT NULL, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `notifications` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `notification_id` TEXT, `recipient_phone` TEXT, `sender_phone` TEXT, `message` TEXT, `notification_type` TEXT, `channel` TEXT, `status` TEXT, `provider_message_id` TEXT, `metadata` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `orders` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `order_type` TEXT, `total` REAL NOT NULL DEFAULT 0, `currency` TEXT, `items_json` TEXT, `status` TEXT, `notes` TEXT, `pos_salesorder_id` TEXT, `pos_confirmed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
@@ -573,6 +573,9 @@ async function ensureSchema(env) {
       'ALTER TABLE `orders` ADD COLUMN `scheduled_delivery_at` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `pos_salesorder_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `pos_confirmed_at` TEXT',
+      'ALTER TABLE `manager_status_checks` ADD COLUMN `inbound_control_url` TEXT',
+      'ALTER TABLE `manager_status_checks` ADD COLUMN `callback_status` TEXT',
+      'ALTER TABLE `manager_status_checks` ADD COLUMN `callback_sent_at` TEXT',
       'ALTER TABLE `menu_items` ADD COLUMN `price_cents` INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE `menu_items` ADD COLUMN `size` TEXT',
       'ALTER TABLE `menu_items` ADD COLUMN `flavor` TEXT',
@@ -2725,6 +2728,7 @@ async function storeManagerCallResult(env, tenantId, message) {
     'SELECT * FROM `manager_status_checks` WHERE `tenant_id` = ? AND `outbound_call_id` = ? LIMIT 1'
   ).bind(tenantId, callId).first();
   if (!row) return { matched: false };
+
   const artifact = message?.artifact || {};
   const userLines = Array.isArray(artifact.messages)
     ? artifact.messages.filter(item => norm(item?.role) === 'user')
@@ -2734,15 +2738,53 @@ async function storeManagerCallResult(env, tenantId, message) {
   const managerResponse = clean(userLines.join('\n') || transcript, 4000);
   const endedReason = clean(message?.endedReason || message?.call?.endedReason || '', 100);
   const finalStatus = managerResponse ? 'completed' : 'no_manager_response';
+  const storedResponse = managerResponse || ('Manager call ended without a captured reply. ' + endedReason).slice(0, 4000);
   await env.DB.prepare(
     'UPDATE `manager_status_checks` SET `status` = ?, `manager_response` = ?, `completed_at` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND `id` = ?'
-  ).bind(finalStatus, managerResponse || ('Manager call ended without a captured reply. ' + endedReason).slice(0, 4000),
-    nowIso(), nowIso(), tenantId, row.id).run();
+  ).bind(finalStatus, storedResponse, nowIso(), nowIso(), tenantId, row.id).run();
+
+  let customerCallback = { sent: false, reason: 'no_inbound_control_url' };
+  const inboundCallId = clean(row.inbound_call_id || '', 120);
+  const controlUrl = clean(row.inbound_control_url || '', 1000);
+  if (inboundCallId && controlUrl) {
+    const inboundCall = await env.DB.prepare(
+      'SELECT `status` FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
+    ).bind(tenantId, inboundCallId).first();
+    if (norm(inboundCall?.status) === 'in_progress') {
+      try {
+        const parsed = new URL(controlUrl);
+        if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.vapi.ai') || !parsed.pathname.endsWith('/control')) {
+          throw new AppError('Stored inbound Vapi control URL failed origin validation.', 'invalid_call_control_url', 502);
+        }
+        const customerMessage = managerResponse
+          ? 'I have checked with the Alex Pizza manager about order ' + clean(row.order_reference, 40) + '. The manager says: ' + clean(managerResponse, 800)
+          : 'I could not get a verified update from the manager for order ' + clean(row.order_reference, 40) + ' yet. The team has been asked to follow up. I will not guess the status.';
+        const callback = await fetchWithTimeout(parsed.toString(), {
+          method: 'POST',
+          headers: vapiControlHeaders(env),
+          body: JSON.stringify({ type: 'say', content: customerMessage, endCallAfterSpoken: false })
+        }, 8000);
+        customerCallback = { sent: callback.ok, status: callback.status, reason: callback.ok ? undefined : 'vapi_control_rejected' };
+        await env.DB.prepare(
+          'UPDATE `manager_status_checks` SET `callback_status` = ?, `callback_sent_at` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND `id` = ?'
+        ).bind(callback.ok ? 'sent' : 'failed', callback.ok ? nowIso() : null, nowIso(), tenantId, row.id).run();
+      } catch (err) {
+        customerCallback = { sent: false, reason: clean(err?.code || 'customer_callback_failed', 80) };
+        await env.DB.prepare(
+          'UPDATE `manager_status_checks` SET `callback_status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND `id` = ?'
+        ).bind('failed', nowIso(), tenantId, row.id).run();
+      }
+    } else {
+      customerCallback = { sent: false, reason: 'inbound_call_already_ended' };
+    }
+  }
+
   await audit(env, tenantId, 'manager_status_call_completed', {
     check_id: row.id, order_reference: row.order_reference, status: finalStatus,
-    response_captured: Boolean(managerResponse), ended_reason: endedReason
+    response_captured: Boolean(managerResponse), ended_reason: endedReason,
+    customer_callback_sent: Boolean(customerCallback.sent)
   });
-  return { matched: true, check_id: row.id, status: finalStatus };
+  return { matched: true, check_id: row.id, status: finalStatus, customer_callback: customerCallback };
 }
 
 async function initiateManagerStatusCall(env, tenantId, order, checkId, managerPhone, context = {}) {
