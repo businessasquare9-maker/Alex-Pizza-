@@ -167,7 +167,7 @@ try {
 
   assert.match(source, /customer_order_confirmation: 'saved_independently_of_pos_status'/);
   assert.match(source, /dispatchOrderReceipt\(env, tenantId, order, customerPhone\)/);
-  assert.match(source, /retry-exhausted/ .source || source, /retry_exhausted/);
+  assert.match(source, /retry_exhausted/);
 
   const destructiveMenuDelete = /DELETE FROM `menu_items`/i.test(source) ||
     sqlSeen.some(sql => /DELETE FROM `menu_items`/i.test(sql));
