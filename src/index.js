@@ -2149,6 +2149,9 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
       });
       return { ok: false, order_id: orderId, status: 'pos_sync_failed' };
     }
+    if (result?.cancelled) {
+      return { ok: true, order_id: orderId, status: 'cancelled', zoho: result };
+    }
     if (result?.pushed) {
       await step.do('mark-pos-confirmed-' + orderId, async () => {
         await updateOrderStatus(this.env, tenantId, orderId, 'pos_confirmed');
@@ -2421,6 +2424,41 @@ async function getOrderStatus(env, tenantId, args) {
     created_at: createdColumn ? row[createdColumn] : null
   };
 }
+async function enqueueOrderPosSync(env, tenantId, orderId, changeKind) {
+  if (!env.ORDER_WORKFLOW || typeof env.ORDER_WORKFLOW.create !== 'function') {
+    await recordIntegrationStatus(env, tenantId, 'order_workflow', 'binding_missing_after_order_change', {
+      order_id: orderId, change_kind: changeKind
+    });
+    try {
+      await queueRoleNotification(env, tenantId, 'manager',
+        'Order ' + orderId + ' was changed in D1, but automatic Zoho POS sync could not start. Check the original POS bill.',
+        'order_pos_sync_required');
+    } catch {}
+    return { queued: false, status: 'workflow_binding_missing' };
+  }
+  const workflowId = 'order-change-' + clean(orderId, 40).toLowerCase() + '-' + makeId(6).toLowerCase();
+  try {
+    await env.ORDER_WORKFLOW.create({
+      id: workflowId,
+      params: { tenant_id: tenantId, order_id: orderId }
+    });
+    await audit(env, tenantId, 'order_pos_update_workflow_started', {
+      order_id: orderId, workflow_id: workflowId, change_kind: changeKind
+    });
+    return { queued: true, workflow_id: workflowId, status: 'pending_pos_update' };
+  } catch (err) {
+    await recordIntegrationStatus(env, tenantId, 'order_workflow', 'start_failed_after_order_change', {
+      order_id: orderId, change_kind: changeKind, code: clean(err?.code || 'workflow_start_failed', 80)
+    });
+    try {
+      await queueRoleNotification(env, tenantId, 'manager',
+        'Order ' + orderId + ' was changed in D1, but Zoho POS update workflow could not start. Manually reconcile the POS bill.',
+        'order_pos_sync_error');
+    } catch {}
+    return { queued: false, status: 'workflow_start_failed' };
+  }
+}
+
 async function requestOrderChange(env, tenantId, args) {
   await ensureSchema(env);
   const orderId = clean(args.order_reference || args.order_id || args.id || '', 100);
@@ -2541,7 +2579,8 @@ async function requestOrderChange(env, tenantId, args) {
     } catch (err) {
       updatedReceipt = { status: 'dispatch_error', error: clean(publicError(err).error, 160) };
     }
-    return { ok: true, additions_applied: true, updated_receipt: updatedReceipt, original_order_unchanged: false,
+    const posSync = await enqueueOrderPosSync(env, tenantId, orderId, 'addition_5_to_20_minutes');
+    return { ok: true, additions_applied: true, updated_receipt: updatedReceipt, pos_sync: posSync, original_order_unchanged: false,
       order_id: orderId, total: newTotal, currency: CURRENCY, item_count: combinedItems.length,
       status: 'additions_applied_to_original_bill',
       message_for_assistant: 'The additional items were added to the original bill. Cancellation is not allowed after the first 5 minutes. Do not claim the Zoho POS or kitchen ticket was automatically amended; the manager has been notified.' };
@@ -2601,7 +2640,8 @@ async function requestOrderChange(env, tenantId, args) {
   } catch (err) {
     updatedReceipt = { status: 'dispatch_error', error: clean(publicError(err).error, 160) };
   }
-  return { ok: true, change_applied: true, updated_receipt: updatedReceipt, order_id: orderId,
+  const posSync = await enqueueOrderPosSync(env, tenantId, orderId, 'full_edit_0_to_5_minutes');
+  return { ok: true, change_applied: true, updated_receipt: updatedReceipt, pos_sync: posSync, order_id: orderId,
     total, currency: CURRENCY, item_count: priced.length, status: 'updated_within_policy',
     message_for_assistant: 'The complete revised order was saved atomically within the first 5 minutes. The manager and customer receipt dispatch were initiated. Do not claim the POS or kitchen copy was changed automatically.' };
 }
@@ -2735,9 +2775,21 @@ async function requestOrderCancellation(env, tenantId, args) {
         'ORDER CANCELLED within the first 5 minutes: ' + orderId + '. Check Zoho/kitchen if already received.',
         'order_cancelled');
     } catch {}
-    await audit(env, tenantId, 'order_cancelled_within_five_minutes', { order_id: orderId });
+    let posVoid = { voided: false, skipped: true, reason: 'zoho_sales_order_not_created_yet' };
+    try {
+      const existingZohoId = await getStoredZohoSalesOrderId(env, tenantId, orderId);
+      if (existingZohoId) posVoid = await voidZohoSalesOrder(env, tenantId, orderId, existingZohoId);
+    } catch (err) {
+      posVoid = { voided: false, error: clean(publicError(err).error, 160) };
+      try {
+        await queueRoleNotification(env, tenantId, 'manager',
+          'Cancellation was saved in D1, but Zoho could not void the related sales order. Order: ' + orderId,
+          'zoho_order_void_error');
+      } catch {}
+    }
+    await audit(env, tenantId, 'order_cancelled_within_five_minutes', { order_id: orderId, zoho_voided: Boolean(posVoid.voided) });
     return {
-      ok: true, cancelled: true, order_reference: orderId, status: 'cancelled_within_policy',
+      ok: true, cancelled: true, order_reference: orderId, status: 'cancelled_within_policy', zoho_pos: posVoid,
       message_for_assistant: 'The order was cancelled within the first 5 minutes. The manager was alerted to stop kitchen/POS processing if already started.'
     };
   }
