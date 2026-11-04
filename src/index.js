@@ -13,7 +13,7 @@ import { WorkflowEntrypoint } from 'cloudflare:workers';
  * Paste Blocks 1 through 10, in order, into one Cloudflare Worker module.
  */
 
-const WORKER_NAME = 'alex-pizza-voice-agent';
+const WORKER_NAME = 'calling-agent-api';
 const DEFAULT_TENANT = 'alex-pizza';
 const CURRENCY = 'USD';
 const TIME_ZONE_DEFAULT = 'America/New_York';
@@ -504,7 +504,7 @@ const SCHEMA_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS `business_settings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `setting_key` TEXT, `setting_value` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `audit_log` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `event` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `integration_status` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `provider` TEXT, `status` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `menu_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `sku` TEXT, `name` TEXT NOT NULL, `category` TEXT, `price` REAL NOT NULL DEFAULT 0, `active` INTEGER NOT NULL DEFAULT 1, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `menu_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `sku` TEXT, `name` TEXT NOT NULL, `category` TEXT, `size` TEXT, `flavor` TEXT, `price_cents` INTEGER NOT NULL DEFAULT 0, `price` REAL, `active` INTEGER NOT NULL DEFAULT 1, `pos_variant_id` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `bookings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `booking_time` TEXT NOT NULL, `duration_minutes` INTEGER NOT NULL DEFAULT 90, `party_size` INTEGER, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_tasks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `task_id` TEXT, `title` TEXT, `description` TEXT, `priority` TEXT, `status` TEXT, `caller_hash` TEXT, `dedupe_key` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
@@ -547,6 +547,9 @@ async function ensureSchema(env) {
       'ALTER TABLE `orders` ADD COLUMN `related_order_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `delivery_batch_id` TEXT',
       'ALTER TABLE `orders` ADD COLUMN `scheduled_delivery_at` TEXT',
+      'ALTER TABLE `menu_items` ADD COLUMN `size` TEXT',
+      'ALTER TABLE `menu_items` ADD COLUMN `flavor` TEXT',
+      'ALTER TABLE `menu_items` ADD COLUMN `pos_variant_id` TEXT',
       'ALTER TABLE `invoices` ADD COLUMN `due_at` TEXT',
       'ALTER TABLE `calls` ADD COLUMN `duration_seconds` INTEGER',
       'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER',
@@ -1816,10 +1819,7 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
         await audit(this.env, tenantId, 'order_pos_confirmed', { order_id: orderId, salesorder_id: result.salesorder_id || null });
         return { status: 'pos_confirmed' };
       });
-      await step.do('send-confirmed-receipt-' + orderId, { retries: { limit: 2, delay: '10 seconds', backoff: 'exponential' } }, async () => {
-        return await dispatchOrderReceipt(this.env, tenantId, order, order.customerPhone);
-      });
-      return { ok: true, order_id: orderId, status: 'pos_confirmed', zoho: result };
+      return { ok: true, order_id: orderId, status: 'pos_confirmed', zoho: result, receipt_dispatched_at_order_acceptance: true };
     }
     await step.do('mark-pos-pending-' + orderId, async () => {
       await updateOrderStatus(this.env, tenantId, orderId, 'pending_pos_configuration');
@@ -1954,6 +1954,11 @@ async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, re
 }
 async function submitOrder(env, tenantId, args, ctx) {
   await ensureSchema(env);
+  const orderHours = isWithinBusinessHours(new Date(), businessConfig(env));
+  if (!orderHours.ok) {
+    throw new AppError('Alex Pizza is not accepting new orders at this time. ' + orderHours.reason,
+      'ordering_closed', 409, { time_zone: businessConfig(env).timeZone, cutoff_minutes: businessConfig(env).cutoffMinutes });
+  }
   if (!env.ORDER_WORKFLOW || typeof env.ORDER_WORKFLOW.create !== 'function') {
     throw new AppError('Order processing Workflow binding ORDER_WORKFLOW is missing; order was not created.', 'workflow_binding_missing', 503);
   }
@@ -1997,6 +2002,25 @@ async function submitOrder(env, tenantId, args, ctx) {
   const repeat = await detectRepeatCaller(env, tenantId, customerPhone, args.call_purpose || 'New order submission');
   const order = await createOrderRecord(env, tenantId, args, pricedItems, callerRef, customerPhone);
   await updateOrderStatus(env, tenantId, order.order_id, 'pending_pos_sync');
+  let receiptDispatch = { status: 'not_dispatched', reason: 'receipt_dispatch_not_attempted' };
+  try {
+    receiptDispatch = await dispatchOrderReceipt(env, tenantId, order, customerPhone);
+    await audit(env, tenantId, 'order_receipt_dispatched', {
+      order_id: order.order_id,
+      customer_notification_queued: Boolean(receiptDispatch.customer?.queued),
+      manager_notifications_queued: Number(receiptDispatch.manager?.queued || 0)
+    });
+  } catch (err) {
+    receiptDispatch = { status: 'dispatch_error', error: clean(publicError(err).error, 160) };
+    await recordIntegrationStatus(env, tenantId, 'order_receipts', 'error', {
+      order_id: order.order_id, code: clean(err?.code || 'receipt_dispatch_failed', 80)
+    });
+    try {
+      await queueRoleNotification(env, tenantId, 'manager',
+        'Customer-confirmed order ' + order.order_id + ' is saved in D1, but receipt dispatch needs attention.',
+        'order_receipt_dispatch_error');
+    } catch {}
+  }
   let workflowQueued = true;
   try {
     await env.ORDER_WORKFLOW.create({
@@ -2027,7 +2051,8 @@ async function submitOrder(env, tenantId, args, ctx) {
     item_count: order.items.length,
     repeat_caller_alert: repeat.flagged,
     caller_ref: callerRef,
-    receipt: 'Receipt will be sent after Zoho POS confirms the order.',
+    receipt: receiptDispatch,
+    customer_order_confirmation: 'saved_independently_of_pos_status',
     zoho_pos: workflowQueued ? 'workflow_queued_pending_confirmation' : 'manual_review_required',
     ...(relatedOrder ? { related_order_id: relatedOrder.order_id || relatedOrder.id, delivery_batch_id: args.__delivery_batch_id, scheduled_delivery_at: args.__scheduled_delivery_at || null, combined_delivery: true } : {})
   };
@@ -2066,51 +2091,155 @@ async function requestOrderChange(env, tenantId, args) {
   const orderId = clean(args.order_reference || args.order_id || args.id || '', 100);
   const phone = customerPhoneFrom(args, true);
   const requestedChange = clean(args.requested_changes || args.requested_change || args.change || '', 2000);
-  if (!orderId || !requestedChange) throw new AppError('order_reference and requested_changes are required.', 'change_request_incomplete', 400);
+  if (!orderId || !requestedChange) {
+    throw new AppError('order_reference and requested_changes are required.', 'change_request_incomplete', 400);
+  }
   const verified = await getOrderStatus(env, tenantId, { order_reference: orderId, customer_phone: phone });
   const ageMinutes = Math.max(0, (Date.now() - new Date(verified.created_at || Date.now()).getTime()) / 60000);
   const decision = norm(args.customer_decision || '');
-  if (ageMinutes > 5) {
+
+  // After 20 minutes the original bill is immutable. A separate linked order may be created.
+  if (ageMinutes > 20) {
     const requestId = 'CHG-' + makeId(8);
     if (decision === 'no') {
       await insertScoped(env, 'order_change_requests', tenantId, [
         [['id', 'request_id'], requestId], [['order_id'], orderId],
         [['requested_change', 'change', 'message'], requestedChange],
-        [['reason'], 'Customer declined a separate replacement order after the 5-minute change window.'],
+        [['reason'], 'Customer declined a separate follow-up order after the 20-minute change window.'],
         [['status'], 'customer_declined_new_order_manager_awareness'], [['created_at'], nowIso()]
       ]);
-      const task = await createManagerTask(env, tenantId, 'Customer declined new order after late change request',
+      const task = await createManagerTask(env, tenantId, 'Customer declined separate order after 20 minutes',
         'Original order ' + orderId + ' remains unchanged. Requested change: ' + requestedChange, 'normal');
       await audit(env, tenantId, 'late_order_change_declined', { order_id: orderId, request_id: requestId, task_id: task.task_id });
-      return { ok: true, original_order_unchanged: true, new_order_created: false, status: 'manager_awareness_recorded', message_for_assistant: 'Tell the customer the original order remains unchanged. The manager has been notified for awareness; do not transfer the call.' };
+      return { ok: true, original_order_unchanged: true, new_order_created: false, status: 'manager_awareness_recorded',
+        message_for_assistant: 'Tell the customer the original order remains unchanged. The manager has been notified for awareness; do not transfer the call.' };
     }
     if (decision === 'yes') {
-      return { ok: true, original_order_unchanged: true, new_order_created: false, requires_new_order_submission: true, related_order_reference: orderId, message_for_assistant: 'The customer agreed to a separate new order. Collect the complete new items and total, read them back, get explicit confirmation, then call submit_order with related_order_reference set to this original order reference and deliver_with_original true. Never edit or cancel the original order.' };
+      return { ok: true, original_order_unchanged: true, new_order_created: false, requires_new_order_submission: true,
+        related_order_reference: orderId,
+        message_for_assistant: 'The customer agreed to a separate new order. Collect the complete new items, read them back, get explicit confirmation, then call submit_order with related_order_reference set to this original order reference and deliver_with_original true. The original order and bill must remain unchanged.' };
     }
-    return { ok: true, original_order_unchanged: true, requires_customer_decision: true, message_for_assistant: 'The 5-minute change window has passed. Do not modify the original order. Ask whether the customer wants a separate new order to be delivered together with the original. If yes, collect and confirm the complete new order. If no, call request_order_change again with customer_decision no to record manager awareness. Do not transfer the call.' };
+    return { ok: true, original_order_unchanged: true, requires_customer_decision: true,
+      message_for_assistant: 'More than 20 minutes have passed. Do not change or cancel the original bill. Ask whether the customer wants a separate new order delivered together with the original at its scheduled delivery time. If yes, collect and confirm the new order. If no, call request_order_change again with customer_decision no to record manager awareness. Do not transfer the call.' };
   }
 
+  // Between 5 and 20 minutes, only additions to the original bill are allowed.
+  if (ageMinutes > 5) {
+    if (args.customer_confirmed !== true) {
+      return { ok: true, within_addition_window: true, original_order_unchanged: true,
+        requires_customer_confirmation: true,
+        message_for_assistant: 'Between 5 and 20 minutes, the customer may only ADD items to the existing bill. Do not remove items, replace the order, or cancel it. Read the added items and revised total back and obtain explicit confirmation.' };
+    }
+    if (!Array.isArray(args.items) || !args.items.length) {
+      throw new AppError('For a 5-to-20-minute addition, provide only the additional items and customer_confirmed true.',
+        'addition_items_required', 400);
+    }
+    const addedItems = await loadPricedItems(env, tenantId, args.items, null);
+    const original = await env.DB.prepare(
+      'SELECT * FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) LIMIT 1'
+    ).bind(tenantId, orderId, orderId).first();
+    if (!original) throw new AppError('Order not found.', 'order_not_found', 404);
+
+    let existingItems = [];
+    try {
+      const parsed = JSON.parse(original.items_json || '[]');
+      if (Array.isArray(parsed)) existingItems = parsed;
+    } catch {}
+    if (!existingItems.length) {
+      const rows = await env.DB.prepare(
+        'SELECT * FROM `order_items` WHERE `tenant_id` = ? AND `order_id` = ? ORDER BY `created_at`'
+      ).bind(tenantId, orderId).all();
+      existingItems = (rows.results || []).map(row => ({
+        sku: row.sku, name: row.name, category: row.category,
+        unitPrice: Number(row.unit_price || 0), quantity: Number(row.quantity || 1),
+        lineTotal: Number(row.line_total || 0)
+      }));
+    }
+    const combinedItems = [...existingItems, ...addedItems].map(item => ({
+      sku: clean(item.sku, 80), name: clean(item.name, 200), category: clean(item.category, 80),
+      unitPrice: roundMoney(item.unitPrice ?? item.unit_price),
+      quantity: Math.max(1, Math.floor(Number(item.quantity) || 1)),
+      lineTotal: roundMoney(item.lineTotal ?? item.line_total)
+    }));
+    const newTotal = roundMoney(combinedItems.reduce((sum, item) => sum + item.lineTotal, 0));
+    const stamp = nowIso();
+    const minCreated = new Date(Date.now() - 20 * 60000).toISOString();
+    const maxCreated = new Date(Date.now() - 5 * 60000).toISOString();
+    const statements = [
+      env.DB.prepare(
+        "UPDATE `orders` SET `items_json` = ?, `total` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `created_at` >= ? AND `created_at` < ? AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
+      ).bind(JSON.stringify(combinedItems), newTotal, stamp, tenantId, orderId, orderId, minCreated, maxCreated),
+      env.DB.prepare(
+        'DELETE FROM `order_items` WHERE `tenant_id` = ? AND `order_id` = ? AND EXISTS (SELECT 1 FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `updated_at` = ?)'
+      ).bind(tenantId, orderId, tenantId, orderId, orderId, stamp),
+      ...combinedItems.map(item => env.DB.prepare(
+        'INSERT INTO `order_items` (`tenant_id`, `id`, `order_id`, `sku`, `name`, `category`, `unit_price`, `quantity`, `line_total`, `created_at`) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `updated_at` = ?)'
+      ).bind(tenantId, makeId(16), orderId, item.sku, item.name, item.category, item.unitPrice, item.quantity, item.lineTotal, stamp, tenantId, orderId, orderId, stamp))
+    ];
+    const batch = await env.DB.batch(statements);
+    if (Number(batch?.[0]?.meta?.changes || 0) !== 1) {
+      throw new AppError('The 5-to-20-minute addition window expired or the order is no longer editable. No additions were applied.',
+        'addition_window_expired', 409);
+    }
+    await insertScoped(env, 'order_change_requests', tenantId, [
+      [['id', 'request_id'], 'ADD-' + makeId(8)], [['order_id'], orderId],
+      [['requested_change', 'change', 'message'], requestedChange],
+      [['reason'], 'Customer-confirmed additions within the 5-to-20-minute policy.'],
+      [['status'], 'additions_applied_to_original_bill'], [['created_at'], nowIso()]
+    ]);
+    await audit(env, tenantId, 'order_additions_applied_5_to_20_minutes', {
+      order_id: orderId, added_item_count: addedItems.length, new_total: newTotal
+    });
+    try {
+      await queueRoleNotification(env, tenantId, 'manager',
+        'CUSTOMER-APPROVED ADDITION added to existing bill ' + orderId + '. Revised total: ' + money(newTotal),
+        'order_addition_applied');
+    } catch {}
+    return { ok: true, additions_applied: true, original_order_unchanged: false,
+      order_id: orderId, total: newTotal, currency: CURRENCY, item_count: combinedItems.length,
+      status: 'additions_applied_to_original_bill',
+      message_for_assistant: 'The additional items were added to the original bill. Cancellation is not allowed after the first 5 minutes. Do not claim the Zoho POS or kitchen ticket was automatically amended; the manager has been notified.' };
+  }
+
+  // First five minutes: a complete replacement is permitted after explicit confirmation.
   if (args.customer_confirmed !== true) {
-    return { ok: true, within_change_window: true, change_applied: false, requires_customer_confirmation: true, message_for_assistant: 'The order is within the first 5 minutes. Prepare the complete revised items, read the revised order and total back, and get an explicit yes. Then call request_order_change with items and customer_confirmed true.' };
+    return { ok: true, within_change_window: true, change_applied: false, requires_customer_confirmation: true,
+      message_for_assistant: 'The order is within the first 5 minutes. Prepare the complete revised items, read the revised order and total back, and get an explicit yes. Then call request_order_change with the complete revised items and customer_confirmed true.' };
   }
   if (!Array.isArray(args.items) || !args.items.length) {
-    throw new AppError('For a change within 5 minutes, provide the complete revised items array and customer_confirmed true.', 'structured_order_items_required', 400);
+    throw new AppError('For a change within 5 minutes, provide the complete revised items array and customer_confirmed true.',
+      'structured_order_items_required', 400);
   }
   const priced = await loadPricedItems(env, tenantId, args.items, null);
   const total = roundMoney(priced.reduce((sum, item) => sum + item.lineTotal, 0));
-  const itemsJson = JSON.stringify(priced.map(item => ({ sku: item.sku, name: item.name, category: item.category, unit_price: item.unitPrice, quantity: item.quantity, line_total: item.lineTotal })));
-  const update = await env.DB.prepare("UPDATE `orders` SET `items_json` = ?, `total` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `created_at` >= ? AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')")
-    .bind(itemsJson, total, nowIso(), tenantId, orderId, orderId, new Date(Date.now() - 5 * 60000).toISOString()).run();
-  if (Number(update.meta?.changes || 0) !== 1) throw new AppError('The order change window expired while the update was being processed. The original order was not changed.', 'change_window_expired', 409);
+  const itemsJson = JSON.stringify(priced.map(item => ({
+    sku: item.sku, name: item.name, category: item.category,
+    unit_price: item.unitPrice, quantity: item.quantity, line_total: item.lineTotal
+  })));
+  const update = await env.DB.prepare(
+    "UPDATE `orders` SET `items_json` = ?, `total` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND `created_at` >= ? AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
+  ).bind(itemsJson, total, nowIso(), tenantId, orderId, orderId, new Date(Date.now() - 5 * 60000).toISOString()).run();
+  if (Number(update.meta?.changes || 0) !== 1) {
+    throw new AppError('The order change window expired while the update was being processed. The original order was not changed.',
+      'change_window_expired', 409);
+  }
   await env.DB.prepare('DELETE FROM `order_items` WHERE `tenant_id` = ? AND `order_id` = ?').bind(tenantId, orderId).run();
-  for (const item of priced) await insertScoped(env, 'order_items', tenantId, [
-    [['id'], makeId(16)], [['order_id'], orderId], [['sku'], item.sku], [['name', 'item_name'], item.name],
-    [['category'], item.category], [['unit_price', 'price'], item.unitPrice], [['quantity'], item.quantity],
-    [['line_total'], item.lineTotal], [['created_at'], nowIso()]
-  ]);
+  for (const item of priced) {
+    await insertScoped(env, 'order_items', tenantId, [
+      [['id'], makeId(16)], [['order_id'], orderId], [['sku'], item.sku], [['name', 'item_name'], item.name],
+      [['category'], item.category], [['unit_price', 'price'], item.unitPrice], [['quantity'], item.quantity],
+      [['line_total'], item.lineTotal], [['created_at'], nowIso()]
+    ]);
+  }
   await audit(env, tenantId, 'order_changed_within_five_minutes', { order_id: orderId, new_total: total, item_count: priced.length });
-  try { await queueRoleNotification(env, tenantId, 'manager', 'ORDER UPDATED within 5-minute customer change window: ' + orderId + ', new total ' + money(total), 'order_changed'); } catch {}
-  return { ok: true, change_applied: true, order_id: orderId, total, currency: CURRENCY, item_count: priced.length, status: 'updated_within_policy', pos_sync: 'manager_alerted_for_manual_pos_reconciliation_if_already_sent', message_for_assistant: 'The revised order is saved in the Worker and the manager was alerted. Do not claim the POS or kitchen copy was changed automatically.' };
+  try {
+    await queueRoleNotification(env, tenantId, 'manager',
+      'ORDER UPDATED within 5-minute customer change window: ' + orderId + ', new total ' + money(total),
+      'order_changed');
+  } catch {}
+  return { ok: true, change_applied: true, order_id: orderId, total, currency: CURRENCY,
+    item_count: priced.length, status: 'updated_within_policy',
+    message_for_assistant: 'The revised order is saved in the Worker and the manager was alerted. Do not claim the POS or kitchen copy was changed automatically.' };
 }
 
 function getBusinessInfo(env) {
@@ -2121,6 +2250,8 @@ function getBusinessInfo(env) {
     currency: CURRENCY,
     time_zone: config.timeZone,
     hours: businessHoursMessage(config),
+    order_cutoff_minutes_before_close: config.cutoffMinutes,
+    ordering_window_enforced: true,
     open_hour: config.openHour,
     close_hour: config.closeHour,
     reservation_cutoff_minutes: config.cutoffMinutes,
@@ -2339,7 +2470,7 @@ const TOOL_CATALOG = [
   { name: 'check_table_availability', description: 'Check reservation availability in America/New_York business time.', parameters: { type: 'object', properties: { party_size: { type: 'integer', minimum: 1, maximum: 40, description: 'Number of guests; restaurant capacity is 40 seats across 10 four-seat tables.' }, booking_time: { type: 'string', description: 'ISO 8601 date/time including timezone offset' }, duration_minutes: { type: 'integer', minimum: 30, maximum: 240 } }, required: ['booking_time', 'party_size'], additionalProperties: false } },
   { name: 'request_order_cancel', description: 'Within 5 minutes cancel the current order. After 5 minutes never cancel the original; ask whether the customer wants a separate new order delivered with it.', parameters: { type: 'object', properties: { reason: { type: 'string' }, customer_phone: { type: 'string' }, order_reference: { type: 'string' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'reason'], additionalProperties: false } },
   { name: 'submit_order', description: 'Submit customer-confirmed pickup or delivery order. POS confirmation is asynchronous; report pending until confirmed.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, notes: { type: 'string' }, order_type: { type: 'string', enum: ['pickup', 'delivery'] }, customer_name: { type: 'string' }, customer_phone: { type: 'string' }, delivery_address: { type: 'string' }, customer_confirmed: { type: 'boolean' }, related_order_reference: { type: 'string' }, deliver_with_original: { type: 'boolean' } }, required: ['customer_name', 'customer_phone', 'order_type', 'items', 'customer_confirmed'], additionalProperties: false } },
-  { name: 'request_order_change', description: 'Within 5 minutes update the current order using a complete revised items array and explicit confirmation. After 5 minutes offer a separate new linked order; never alter the original.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' }, requested_changes: { type: 'string' }, items: { type: 'array', items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, customer_confirmed: { type: 'boolean' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'requested_changes'], additionalProperties: false } },
+  { name: 'request_order_change', description: '0-5 minutes: replace the complete order after customer confirmation. 5-20 minutes: only add items to the existing bill after confirmation; no cancellation or removals. After 20 minutes: original bill is locked; offer a separate linked order delivered with the original.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' }, requested_changes: { type: 'string' }, items: { type: 'array', items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } }, customer_confirmed: { type: 'boolean' }, customer_decision: { type: 'string', enum: ['yes', 'no'] } }, required: ['order_reference', 'customer_phone', 'requested_changes'], additionalProperties: false } },
   { name: 'check_order_status', description: 'Look up an order after matching its reference and customer phone.', parameters: { type: 'object', properties: { customer_phone: { type: 'string' }, order_reference: { type: 'string' } }, required: ['order_reference', 'customer_phone'], additionalProperties: false } },
   { name: 'get_business_hours', description: 'Return business hours, time zone and reservation cutoff.', parameters: { type: 'object', properties: {}, required: [], additionalProperties: false } },
   { name: 'calculate_order', description: 'Calculate a price estimate from active D1 menu items without submitting an order.', parameters: { type: 'object', properties: { items: { type: 'array', minItems: 1, items: { type: 'object', required: ['sku', 'quantity'], properties: { sku: { type: 'string' }, quantity: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } } }, required: ['items'], additionalProperties: false } },
