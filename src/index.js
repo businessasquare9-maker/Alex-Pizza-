@@ -89,7 +89,8 @@ const ENV_KEYS = {
   requireCustomerPhone: ['REQUIRE_CUSTOMER_PHONE'],
   allowManualTotal: ['ALLOW_MANUAL_TOTAL'],
   vapiApiKey: ['VAPI_PRIVATE_API_KEY', 'VAPI_API_KEY', 'VAPI_TOKEN'],
-  vapiAssistantId: ['VAPI_MANAGER_ASSISTANT_ID', 'VAPI_ASSISTANT_ID'],
+  vapiAssistantId: ['VAPI_ASSISTANT_ID'],
+  vapiManagerAssistantId: ['VAPI_MANAGER_ASSISTANT_ID', 'VAPI_ASSISTANT_ID'],
   vapiPhoneNumberId: ['VAPI_PHONE_NUMBER_ID'],
   vapiPublicApiKey: ['VAPI_PUBLIC_API_KEY'],
   vapiControlAuth: ['VAPI_CONTROL_AUTHENTICATION_ENABLED']
@@ -2789,7 +2790,7 @@ async function storeManagerCallResult(env, tenantId, message) {
 
 async function initiateManagerStatusCall(env, tenantId, order, checkId, managerPhone, context = {}) {
   const apiKey = envValue(env, ENV_KEYS.vapiApiKey);
-  const assistantId = envValue(env, ENV_KEYS.vapiAssistantId);
+  const assistantId = envValue(env, ENV_KEYS.vapiManagerAssistantId);
   const phoneNumberId = envValue(env, ENV_KEYS.vapiPhoneNumberId) || clean(context.phoneNumberId || '', 120);
   if (!apiKey || !assistantId || !phoneNumberId) {
     throw new AppError('Vapi outbound manager-call settings are incomplete.', 'manager_call_config_incomplete', 503);
@@ -3143,9 +3144,11 @@ async function handleVapiEvents(request, env, tenantId) {
   const blocked = requireMethod(request, env, 'POST');
   if (blocked) return blocked;
   await ensureTenantActive(env, tenantId);
+  const toolRequest = request.clone();
   const body = await readJson(request, env);
   const message = body?.message && typeof body.message === 'object' ? body.message : body;
   const eventType = clean(message?.type || 'unknown', 60);
+  if (eventType === 'tool-calls') return await handleVapiTools(toolRequest, env, {}, tenantId);
   const callId = clean(message?.call?.id || message?.callId || '', 120);
 
   if (eventType === 'status-update') {
@@ -3356,6 +3359,74 @@ async function handleAdmin(request, env, url, path) {
       ok: true, tenant_id: tenantId, order_reference: order.order_id || orderReference,
       workflow_id: workflowId, status: 'pending_pos_sync'
     });
+  }
+async function configureVapiAssistantEvents(env, tenantId, requestOrigin) {
+  const apiKey = envValue(env, ENV_KEYS.vapiApiKey);
+  const assistantId = envValue(env, ENV_KEYS.vapiAssistantId);
+  const sharedSecret = envValue(env, ENV_KEYS.toolSecret);
+  if (!apiKey || !assistantId || !sharedSecret) {
+    throw new AppError('Vapi private key, main assistant ID and Worker shared secret must be present in the configured environment.',
+      'vapi_event_configuration_unavailable', 503);
+  }
+  const eventsUrl = new URL('/vapi/' + encodeURIComponent(tenantId) + '/events', requestOrigin).toString();
+  const headers = { Authorization: 'Bearer ' + apiKey, 'Content-Type': 'application/json' };
+  const getResponse = await fetchWithTimeout('https://api.vapi.ai/assistant/' + encodeURIComponent(assistantId), {
+    method: 'GET', headers: { Authorization: 'Bearer ' + apiKey }
+  }, 10000);
+  let current = {};
+  try { current = await getResponse.json(); } catch {}
+  if (!getResponse.ok) {
+    throw new AppError('Could not read the existing Vapi assistant before updating its event webhook: ' +
+      clean(current.message || current.error || ('HTTP ' + getResponse.status), 160),
+      'vapi_assistant_read_failed', 502, { provider_status: getResponse.status });
+  }
+  const currentServer = current.server && typeof current.server === 'object' ? current.server : {};
+  const currentHeaders = currentServer.headers && typeof currentServer.headers === 'object' ? currentServer.headers : {};
+  const serverMessages = Array.isArray(current.serverMessages) ? [...current.serverMessages] : [
+    'end-of-call-report', 'status-update', 'tool-calls'
+  ];
+  for (const eventName of ['status-update', 'end-of-call-report', 'tool-calls']) {
+    if (!serverMessages.includes(eventName)) serverMessages.push(eventName);
+  }
+  const payload = {
+    server: {
+      ...currentServer,
+      url: eventsUrl,
+      timeoutSeconds: Math.max(10, Math.min(60, Number(currentServer.timeoutSeconds) || 20)),
+      headers: { ...currentHeaders, 'x-vapi-secret': sharedSecret }
+    },
+    serverMessages
+  };
+  const updateResponse = await fetchWithTimeout('https://api.vapi.ai/assistant/' + encodeURIComponent(assistantId), {
+    method: 'PATCH', headers, body: JSON.stringify(payload)
+  }, 10000);
+  let updated = {};
+  try { updated = await updateResponse.json(); } catch {}
+  if (!updateResponse.ok) {
+    throw new AppError('Vapi assistant event webhook update failed: ' +
+      clean(updated.message || updated.error || ('HTTP ' + updateResponse.status), 160),
+      'vapi_assistant_update_failed', 502, { provider_status: updateResponse.status });
+  }
+  await recordIntegrationStatus(env, tenantId, 'vapi_events', 'configured', {
+    assistant_id: assistantId, events_url: eventsUrl,
+    server_messages: serverMessages.filter(item => ['status-update', 'end-of-call-report', 'tool-calls'].includes(item))
+  });
+  await audit(env, tenantId, 'vapi_event_webhook_configured', {
+    assistant_id: assistantId, events_url: eventsUrl
+  });
+  return {
+    ok: true, tenant_id: tenantId, assistant_id: assistantId, server_url: eventsUrl,
+    configured_events: ['status-update', 'end-of-call-report', 'tool-calls'],
+    secret_header_configured: true,
+    note: 'The existing assistant server settings and existing server messages were preserved; only the event URL, shared-secret header and required event subscriptions were updated.'
+  };
+}
+
+  if (path === '/admin/configure-vapi-events') {
+    const tenantId = adminTenant(request, url, body);
+    const origin = new URL(request.url).origin;
+    const result = await configureVapiAssistantEvents(env, tenantId, origin);
+    return json(request, env, result);
   }
   if (path === '/admin/bootstrap') {
     const schema = await ensureSchema(env);
