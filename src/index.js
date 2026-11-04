@@ -3121,6 +3121,39 @@ async function handleAdmin(request, env, url, path) {
     await audit(env, tenantId, 'client_dashboard_token_revoked', {});
     return json(request, env, { ok: true, tenant_id: tenantId, token_revoked: true });
   }
+  if (path === '/admin/retry-order-pos') {
+    const orderReference = clean(body.order_reference || body.order_id || '', 100);
+    if (!orderReference) throw new AppError('order_reference is required.', 'order_reference_required', 400);
+    const order = await env.DB.prepare(
+      'SELECT `order_id`, `status` FROM `orders` WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) LIMIT 1'
+    ).bind(tenantId, orderReference, orderReference).first();
+    if (!order) throw new AppError('Order not found for this tenant.', 'order_not_found', 404);
+    if (['cancelled', 'canceled'].includes(norm(order.status))) {
+      throw new AppError('A cancelled order cannot be sent to Zoho POS.', 'cancelled_order_not_retryable', 409);
+    }
+    if (!env.ORDER_WORKFLOW || typeof env.ORDER_WORKFLOW.create !== 'function') {
+      throw new AppError('Order processing Workflow binding is unavailable.', 'workflow_binding_missing', 503);
+    }
+    const workflowId = 'order-retry-' + clean(order.order_id || orderReference, 40).toLowerCase() + '-' + makeId(6).toLowerCase();
+    await updateOrderStatus(env, tenantId, order.order_id || orderReference, 'pending_pos_sync');
+    try {
+      await env.ORDER_WORKFLOW.create({
+        id: workflowId,
+        params: { tenant_id: tenantId, order_id: order.order_id || orderReference }
+      });
+    } catch (err) {
+      await updateOrderStatus(env, tenantId, order.order_id || orderReference, 'workflow_start_failed');
+      throw new AppError('Could not start the Zoho POS retry workflow: ' + clean(err?.message || 'Workflow error', 140),
+        'workflow_start_failed', 503);
+    }
+    await audit(env, tenantId, 'manual_zoho_pos_retry_started', {
+      order_id: order.order_id || orderReference, workflow_id: workflowId
+    });
+    return json(request, env, {
+      ok: true, tenant_id: tenantId, order_reference: order.order_id || orderReference,
+      workflow_id: workflowId, status: 'pending_pos_sync'
+    });
+  }
   if (path === '/admin/bootstrap') {
     const schema = await ensureSchema(env);
     await audit(env, tenantId, 'schema_bootstrap', schema);
