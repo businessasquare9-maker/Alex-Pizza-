@@ -129,3 +129,4 @@ node verify-build.mjs
 ```
 
 Read-only D1 inspection queries are in `D1_PREDEPLOY_CHECKS.sql`.
+Triggering build
