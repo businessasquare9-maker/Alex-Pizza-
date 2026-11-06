@@ -92,25 +92,30 @@ try {
   assert.equal(safeSync.skipped, true);
   assert.equal(safeSync.existing_menu_items, 1);
 
-  // Capacity calculation: 10 four-seat tables, 40 total seats.
+  // Capacity calculation: use a future booking date so this check remains valid after today.
+  // 18:00 UTC is within the configured 12 PM–2 AM New York business window.
+  const futureBookingTime = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  futureBookingTime.setUTCHours(18, 0, 0, 0);
+  const futureBookingIso = futureBookingTime.toISOString();
+
   bookingRows = [{
     tenant_id: 'alex-pizza', id: 'BOK-OLD',
-    booking_time: '2026-11-04T18:00:00.000Z',
+    booking_time: futureBookingIso,
     duration_minutes: 90, party_size: 36, status: 'confirmed'
   }];
   const overCapacity = await worker.checkAvailability(
-    { DB }, 'alex-pizza', '2026-11-04T18:00:00Z', 90, 5
+    { DB }, 'alex-pizza', futureBookingIso, 90, 5
   );
   assert.equal(overCapacity.available, false);
   assert.equal(overCapacity.seats_occupied, 36);
 
   bookingRows = [{
     tenant_id: 'alex-pizza', id: 'BOK-OLD',
-    booking_time: '2026-11-04T18:00:00.000Z',
+    booking_time: futureBookingIso,
     duration_minutes: 90, party_size: 8, status: 'confirmed'
   }];
   const available = await worker.checkAvailability(
-    { DB }, 'alex-pizza', '2026-11-04T18:00:00Z', 90, 5
+    { DB }, 'alex-pizza', futureBookingIso, 90, 5
   );
   assert.equal(available.available, true);
   assert.equal(available.tables_needed, 2);
