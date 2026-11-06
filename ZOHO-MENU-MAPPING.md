@@ -102,3 +102,47 @@ Mapping is ready only when:
 2. No unresolved duplicate SKU or existing-ID conflict remains.
 3. Price mismatches have been deliberately reconciled.
 4. A real low-value test order is confirmed in Zoho POS before live customer ordering is enabled.
+
+
+## Current Alex Pizza setup — verified menu already exists in D1
+
+The existing project records show 16 active D1 menu rows for tenant `alex-pizza`. Their `pos_variant_id` values are currently empty. Do not create a second D1 menu and do not run a destructive replacement. The Worker route `POST /admin/sync-menu` is intentionally a no-op/preservation check: it returns the existing row count and does not insert menu rows.
+
+The prepared Zoho POS import file is named `alex_pizza_zoho_import_v8_no_product_type.csv` in the user's ChatGPT Library. It contains these 16 items:
+
+| SKU | Item | D1 price (USD) |
+|---|---|---:|
+| WATER-500 | Bottled Water - 500 ml bottle | 1.25 |
+| WATER-1L | Bottled Water - 1 litre bottle | 2.00 |
+| COKE-CAN | Coca-Cola - 355 ml can | 1.50 |
+| COKE-500 | Coca-Cola - 500 ml bottle | 2.00 |
+| COKE-1L | Coca-Cola - 1 litre bottle | 3.00 |
+| COKE-15L | Coca-Cola - 1.5 litre bottle | 3.75 |
+| ICEDTEA-REG | Iced Tea - Regular | 2.25 |
+| LEMONADE | Lemonade - Regular | 2.00 |
+| SPRITE-CAN | Sprite - 355 ml can | 1.50 |
+| SPRITE-1L | Sprite - 1 litre bottle | 3.00 |
+| PIZZA-CHEESE | Cheese Pizza - Medium | 10.00 |
+| PIZZA-CHICKEN | Chicken Pizza - Medium | 13.00 |
+| PIZZA-PEPPERONI | Pepperoni Pizza - Medium | 12.00 |
+| PIZZA-VEGGIE | Veggie Pizza - Medium | 11.00 |
+| FRIES-REG | French Fries - Regular | 3.50 |
+| GARLIC-BREAD | Garlic Bread - Regular | 4.00 |
+
+### Import these existing 16 rows into Zoho POS
+
+1. Open Zoho POS → Items/Inventory → More → Import Items.
+2. Upload `alex_pizza_zoho_import_v8_no_product_type.csv` from the Library after downloading it to your computer.
+3. Choose duplicate handling **Skip** for this first import; do not choose Overwrite.
+4. Use UTF-8 and comma delimiter.
+5. Map the file columns to Zoho fields: Item Name → Name, SKU → SKU, Selling Price/Rate → Rate, Unit → Unit, Description → Description, Category Name → Category, Item Type → Item Type, Status → Status. Ignore the helper `index` column if it appears.
+6. Review the preview. If Zoho reports 16 ready to import and no unexpected skipped/invalid rows, import.
+7. Confirm the Items list contains all 16 SKUs, each active, with the exact D1 selling price.
+
+If Zoho already contains any of these SKUs, stop and compare the existing item rather than creating a duplicate or overwriting it.
+
+### Then run the mapping preview
+
+Use `POST /admin/zoho-item-map-preview` with `{"tenant_id":"alex-pizza"}`. Expect 16 local menu rows and, after successful Zoho import, ideally 16 unique active exact-SKU matches with exact prices. Only after checking the report should `POST /admin/zoho-item-map-apply` be used. The mapping is stored in D1's `menu_items.pos_variant_id`; the optional `ZOHO_ITEM_ID_MAP` environment flag can remain false.
+
+Zoho POS supports item import from CSV/TSV/XLS through **More → Import Items**, followed by field mapping and preview. See https://www.zoho.com/pos/resources/help/import-data.html and the item API schema at https://www.zoho.com/pos/resources/api/items.html.
