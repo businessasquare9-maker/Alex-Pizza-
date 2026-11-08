@@ -600,25 +600,27 @@ async function ensureSchema(env) {
       ).all();
       if ((legacyUsage.results || []).length) {
         const callRows = await env.DB.prepare(
-          'SELECT `ended_at`, `duration_seconds` FROM `calls` WHERE `duration_seconds` > 0 AND `ended_at` IS NOT NULL'
+          'SELECT `tenant_id`, `ended_at`, `duration_seconds` FROM `calls` WHERE `duration_seconds` > 0 AND `ended_at` IS NOT NULL'
         ).all();
-        const secondsByMonth = new Map();
+        const secondsByTenantMonth = new Map();
         for (const call of (callRows.results || [])) {
           const ended = new Date(call.ended_at);
           if (Number.isNaN(ended.getTime())) continue;
           const month = localDateForTimeZone(ended, TIME_ZONE_DEFAULT).slice(0, 7);
-          secondsByMonth.set(month, (secondsByMonth.get(month) || 0) + Math.max(0, Number(call.duration_seconds) || 0));
+          const key = String(call.tenant_id || '') + '|' + month;
+          secondsByTenantMonth.set(key, (secondsByTenantMonth.get(key) || 0) + Math.max(0, Number(call.duration_seconds) || 0));
         }
         const cutoffDate = localDateForTimeZone(new Date(Date.now() - RETENTION_DAYS * 86400000), TIME_ZONE_DEFAULT);
         for (const row of (legacyUsage.results || [])) {
+          const key = String(row.tenant_id || '') + '|' + String(row.month || '');
           const recentCompleteMonth = String(row.month || '') + '-01' >= cutoffDate;
-          const reconstructed = Number(secondsByMonth.get(row.month) || 0);
+          const reconstructed = Number(secondsByTenantMonth.get(key) || 0);
           const seconds = recentCompleteMonth && reconstructed > 0
             ? reconstructed
             : Math.max(0, Number(row.total_minutes) || 0) * 60;
           await env.DB.prepare(
-            'UPDATE `monthly_call_usage` SET `total_seconds` = ?, `total_minutes` = ? WHERE `month` = ? AND `total_seconds` = 0'
-          ).bind(seconds, Math.floor(seconds / 60), row.month).run();
+            'UPDATE `monthly_call_usage` SET `total_seconds` = ?, `total_minutes` = ? WHERE `tenant_id` = ? AND `month` = ? AND `total_seconds` = 0'
+          ).bind(seconds, Math.floor(seconds / 60), row.tenant_id, row.month).run();
         }
       }
     } catch (err) { safeLog(err); }
@@ -1501,16 +1503,15 @@ async function recordCallMinutes(env, tenantId, durationSeconds, endedAt, callId
   const countedAt = ended.toISOString();
   const tickId = id + ':duration';
   // One unique final-duration ledger row per call; webhook retries cannot double count seconds.
-  const ledger = await env.DB.prepare(
-    'INSERT OR IGNORE INTO `call_usage_ticks` (`tenant_id`, `id`, `call_id`, `minute_index`, `month`, `counted_at`, `duration_seconds`, `created_at`) VALUES (?, ?, ?, 0, ?, ?, ?, ?)'
-  ).bind(tenantId, tickId, id, monthKey, countedAt, seconds, nowIso()).run();
-  const counted = Number(ledger.meta?.changes || 0) === 1;
-
-  if (counted) {
-    await env.DB.prepare(
-      "INSERT INTO `monthly_call_usage` (`tenant_id`, `month`, `total_minutes`, `total_seconds`, `last_call_at`, `status`, `updated_at`) VALUES (?, ?, CAST(? / 60 AS INTEGER), ?, ?, 'active', ?) ON CONFLICT(`tenant_id`, `month`) DO UPDATE SET `total_seconds` = `monthly_call_usage`.`total_seconds` + excluded.`total_seconds`, `total_minutes` = CAST((`monthly_call_usage`.`total_seconds` + excluded.`total_seconds`) / 60 AS INTEGER), `last_call_at` = excluded.`last_call_at`, `status` = 'active', `updated_at` = excluded.`updated_at`"
-    ).bind(tenantId, monthKey, seconds, seconds, countedAt, nowIso()).run();
-  }
+  const usageResults = await env.DB.batch([
+    env.DB.prepare(
+      'INSERT OR IGNORE INTO `call_usage_ticks` (`tenant_id`, `id`, `call_id`, `minute_index`, `month`, `counted_at`, `duration_seconds`, `created_at`) VALUES (?, ?, ?, 0, ?, ?, ?, ?)'
+    ).bind(tenantId, tickId, id, monthKey, countedAt, seconds, nowIso()),
+    env.DB.prepare(
+      "INSERT INTO `monthly_call_usage` (`tenant_id`, `month`, `total_minutes`, `total_seconds`, `last_call_at`, `status`, `updated_at`) SELECT ?, ?, CAST(? / 60 AS INTEGER), ?, ?, 'active', ? WHERE changes() = 1 ON CONFLICT(`tenant_id`, `month`) DO UPDATE SET `total_seconds` = `monthly_call_usage`.`total_seconds` + excluded.`total_seconds`, `total_minutes` = CAST((`monthly_call_usage`.`total_seconds` + excluded.`total_seconds`) / 60 AS INTEGER), `last_call_at` = excluded.`last_call_at`, `status` = 'active', `updated_at` = excluded.`updated_at`"
+    ).bind(tenantId, monthKey, seconds, seconds, countedAt, nowIso())
+  ]);
+  const counted = Number(usageResults?.[0]?.meta?.changes || 0) === 1;
 
   await env.DB.prepare(
     "UPDATE `calls` SET `status` = 'ended', `duration_seconds` = ?, `billable_minutes` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ? AND (\`duration_seconds\` IS NULL OR \`duration_seconds\` = 0)"
