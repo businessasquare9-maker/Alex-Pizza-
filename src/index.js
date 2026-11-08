@@ -2558,6 +2558,7 @@ async function submitOrder(env, tenantId, args, ctx) {
       order_id: order.order_id, code: clean(err?.code || 'workflow_start_failed', 80)
     });
     try { await queueRoleNotification(env, tenantId, 'manager', 'Order ' + order.order_id + ' was saved but its POS workflow could not start. Manual review required.', 'order_workflow_error'); } catch {}
+    await notifyCustomerPosIssue(env, tenantId, order, 'order_workflow_start_failed');
   }
   await audit(env, tenantId, 'order_submitted', {
     order_id: order.order_id,
