@@ -1514,7 +1514,7 @@ async function recordCallMinutes(env, tenantId, durationSeconds, endedAt, callId
   const counted = Number(usageResults?.[0]?.meta?.changes || 0) === 1;
 
   await env.DB.prepare(
-    "UPDATE `calls` SET `status` = 'ended', `duration_seconds` = ?, `billable_minutes` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ? AND (\`duration_seconds\` IS NULL OR \`duration_seconds\` = 0)"
+    "UPDATE `calls` SET `status` = 'ended', `duration_seconds` = ?, `billable_minutes` = ?, `ended_at` = ? WHERE `tenant_id` = ? AND `call_id` = ? AND (`duration_seconds` IS NULL OR `duration_seconds` = 0)"
   ).bind(seconds, Math.ceil(seconds / 60), countedAt, tenantId, id).run();
 
   const current = await env.DB.prepare(
