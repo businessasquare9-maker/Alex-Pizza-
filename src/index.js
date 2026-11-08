@@ -4059,14 +4059,14 @@ async function saveManagerMenuItem(env, tenantId, body, create = false) {
   }
   const itemId = clean(body.id || '', 100);
   const existing = create ? null : await env.DB.prepare(
-    'SELECT id, sku FROM menu_items WHERE tenant_id = ? AND (id = ? OR sku = ?) LIMIT 1'
+    'SELECT id, sku, active FROM menu_items WHERE tenant_id = ? AND (id = ? OR sku = ?) LIMIT 1'
   ).bind(tenantId, itemId, itemId).first();
   if (!create && !existing) throw new AppError('Menu item not found for this tenant.', 'menu_item_not_found', 404);
   const duplicate = await env.DB.prepare(
     'SELECT id FROM menu_items WHERE tenant_id = ? AND LOWER(sku) = LOWER(?) LIMIT 1'
   ).bind(tenantId, sku).first();
   if (duplicate && (!existing || duplicate.id !== existing.id)) throw new AppError('That SKU already exists for this tenant.', 'duplicate_menu_sku', 409);
-  const active = body.active === undefined ? (existing ? true : true) : body.active === true;
+  const active = body.active === undefined ? (existing ? Number(existing.active) !== 0 : true) : body.active === true;
   const category = clean(body.category || '', 80);
   const size = clean(body.size || '', 80);
   const flavor = clean(body.flavor || '', 80);
