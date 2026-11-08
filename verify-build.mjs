@@ -143,7 +143,14 @@ try {
   assert.match(source, /claimOrderPosLock/);
   assert.match(source, /releaseOrderPosLock/);
   assert.match(source, /pos_sync_lock_owner/);
-  assert.match(source, /CALL_USAGE_WORKFLOW\.create/);
+  // Exact seconds are recorded once when the call ends. Do not require
+  // a per-minute Workflow.create call or write a D1 row every minute/second.
+  assert.match(source, /async function recordCallMinutes/);
+  assert.match(source, /total_seconds/);
+  assert.match(source, /INSERT OR IGNORE INTO `call_usage_ticks`/);
+  assert.match(source, /monthlyTotalSeconds/);
+  assert.match(source, /status: 'exact_duration_recorded_at_call_end'/);
+  assert.doesNotMatch(source, /CALL_USAGE_WORKFLOW\.create/);
   assert.match(source, /NOTIFICATION_WORKFLOW\.create/);
   assert.match(source, /BOOKING_CALENDAR_WORKFLOW\.create/);
 
@@ -196,7 +203,7 @@ try {
     order_policy: '0–5 edit/cancel; 5–20 additions only; over 20 linked new bill',
     per_bill_pos_lock: true,
     live_manager_status_call_and_complaint_transfer: true,
-    per_minute_usage_and_month_archive: true,
+    exact_seconds_usage_at_call_end: true,\n    monthly_usage_archive: true,
     sixty_day_retention: true,
     multi_tenant_client_and_provider_apis: true,
     automatic_zoho_mapping_by_sku_and_price: true,
