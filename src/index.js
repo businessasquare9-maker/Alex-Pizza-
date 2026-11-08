@@ -4232,7 +4232,7 @@ async function handleManagerApi(request, env, url, path) {
   if (method === 'PATCH' && path === '/manager/tasks') {
     const taskId = clean(body.task_id || body.id || '', 100);
     const status = norm(body.status || '');
-    if (!taskId || !['open','in_progress','acknowledged','resolved','dismissed'].includes(status)) throw new AppError('task_id and a supported status are required.', 'invalid_manager_task_update', 400);
+    if (!taskId || !['open','in_progress','acknowledged','escalated','resolved','dismissed'].includes(status)) throw new AppError('task_id and a supported status are required.', 'invalid_manager_task_update', 400);
     const result = await env.DB.prepare('UPDATE manager_tasks SET status = ? WHERE tenant_id = ? AND (id = ? OR task_id = ?)')
       .bind(status, tenantId, taskId, taskId).run();
     if (Number(result.meta?.changes || 0) !== 1) throw new AppError('Manager task not found.', 'manager_task_not_found', 404);
