@@ -3459,6 +3459,7 @@ async function executeToolCall(env, tenantId, call, index, ctx) {
     // Outbound manager status calls must continue using their explicit customer reference.
     if (ctx?.direction === 'inbound' && ctx?.customerPhone) {
       args.__caller_phone = normalizePhone(ctx.customerPhone);
+      args.customer_phone = args.__caller_phone;
     }
     const payload = await handler(env, tenantId, args, ctx);
     return toolResult(callId, payload);
