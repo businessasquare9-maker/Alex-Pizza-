@@ -4300,6 +4300,9 @@ async function handleManagerApi(request, env, url, path) {
     if (!order.customer_phone) throw new AppError('Stored customer phone is unavailable; order verification cannot be completed.', 'order_customer_verification_unavailable', 409);
     let result;
     if (action === 'cancel') {
+      if (body.customer_confirmed !== true) throw new AppError('Record explicit customer approval before cancelling this order.', 'customer_confirmation_required', 409);
+      const ageMinutes = Math.max(0, (Date.now() - new Date(order.created_at || Date.now()).getTime()) / 60000);
+      if (ageMinutes > 5) throw new AppError('Cancellation is only allowed during the first five minutes after order creation. The original order was not changed.', 'cancel_window_expired', 409);
       result = await requestOrderCancellation(env, tenantId, {
         order_reference: order.order_id || order.id, customer_phone: order.customer_phone,
         reason: clean(body.reason || 'Manager dashboard cancellation request', 1000)
