@@ -3999,6 +3999,337 @@ function deliveryMode(env) {
   return envValue(env, ENV_KEYS.webhookUrl) ? 'webhook' : 'none';
 }
 
+
+async function managerSettingsWrite(env, tenantId, config) {
+  const settings = [
+    ['open_hour', config.openHour], ['close_hour', config.closeHour],
+    ['cutoff_minutes', config.cutoffMinutes], ['max_tables', config.maxTables],
+    ['min_minutes', config.minMinutes], ['max_minutes', config.maxMinutes],
+    ['default_minutes', config.defaultMinutes]
+  ];
+  for (const [key, value] of settings) {
+    const existing = await env.DB.prepare(
+      'SELECT id FROM business_settings WHERE tenant_id = ? AND setting_key = ? LIMIT 1'
+    ).bind(tenantId, key).first();
+    if (existing && existing.id) {
+      await env.DB.prepare('UPDATE business_settings SET setting_value = ? WHERE tenant_id = ? AND id = ?')
+        .bind(String(value), tenantId, existing.id).run();
+    } else {
+      await insertScoped(env, 'business_settings', tenantId, [
+        [['id'], 'SET-' + key + '-' + makeId(6)], [['setting_key'], key],
+        [['setting_value'], String(value)], [['created_at'], nowIso()]
+      ]);
+    }
+  }
+  await audit(env, tenantId, 'business_settings_updated', {
+    open_hour: config.openHour, close_hour: config.closeHour,
+    cutoff_minutes: config.cutoffMinutes, max_tables: config.maxTables,
+    min_minutes: config.minMinutes, max_minutes: config.maxMinutes,
+    default_minutes: config.defaultMinutes
+  });
+  return config;
+}
+
+async function getManagerMenu(env, tenantId) {
+  await ensureSchema(env);
+  const columns = await getColumns(env, 'menu_items');
+  const scope = findColumn(columns, TENANT_COLUMNS);
+  const name = findColumn(columns, ['name', 'item_name', 'title']);
+  if (!scope || !name) throw new AppError('Menu schema is incomplete.', 'menu_schema_incomplete', 500);
+  const rows = await env.DB.prepare('SELECT * FROM ' + q('menu_items') + ' WHERE ' + q(scope) + ' = ? ORDER BY ' + q(name) + ' LIMIT 500')
+    .bind(tenantId).all();
+  return (rows.results || []).map(row => ({
+    id: row.id || row.sku, sku: row.sku || row.id || '', name: row[name] || '',
+    category: row.category || '', size: row.size || '', flavor: row.flavor || '',
+    price_cents: Number(row.price_cents ?? Math.round(Number(row.price || 0) * 100)),
+    price: row.price_cents !== undefined ? roundMoney(Number(row.price_cents || 0) / 100) : parseMoney(row.price),
+    active: row.active === undefined ? true : Boolean(row.active),
+    pos_variant_id: row.pos_variant_id || null,
+    updated_at: row.updated_at || row.created_at || null
+  }));
+}
+
+async function saveManagerMenuItem(env, tenantId, body, create = false) {
+  await ensureSchema(env);
+  const sku = clean(body.sku || '', 80);
+  const name = clean(body.name || body.item_name || '', 160);
+  const priceCents = body.price_cents !== undefined ? Number(body.price_cents) : Math.round(Number(body.price) * 100);
+  if (!sku || !name || !Number.isInteger(priceCents) || priceCents < 0 || priceCents > 10000000) {
+    throw new AppError('A unique SKU, item name and non-negative price_cents are required.', 'invalid_menu_item', 400);
+  }
+  const itemId = clean(body.id || '', 100);
+  const existing = create ? null : await env.DB.prepare(
+    'SELECT id, sku FROM menu_items WHERE tenant_id = ? AND (id = ? OR sku = ?) LIMIT 1'
+  ).bind(tenantId, itemId, itemId).first();
+  if (!create && !existing) throw new AppError('Menu item not found for this tenant.', 'menu_item_not_found', 404);
+  const duplicate = await env.DB.prepare(
+    'SELECT id FROM menu_items WHERE tenant_id = ? AND LOWER(sku) = LOWER(?) LIMIT 1'
+  ).bind(tenantId, sku).first();
+  if (duplicate && (!existing || duplicate.id !== existing.id)) throw new AppError('That SKU already exists for this tenant.', 'duplicate_menu_sku', 409);
+  const active = body.active === undefined ? (existing ? true : true) : body.active === true;
+  const category = clean(body.category || '', 80);
+  const size = clean(body.size || '', 80);
+  const flavor = clean(body.flavor || '', 80);
+  const posId = body.pos_variant_id === undefined || body.pos_variant_id === null || body.pos_variant_id === ''
+    ? null : String(body.pos_variant_id).trim();
+  if (posId && !/^[0-9]{1,24}$/.test(posId)) throw new AppError('Zoho POS item ID must be numeric.', 'invalid_zoho_item_id', 400);
+  if (create) {
+    const id = 'MENU-' + makeId(10);
+    await insertScoped(env, 'menu_items', tenantId, [
+      [['id'], id], [['sku'], sku], [['name'], name], [['category'], category],
+      [['size'], size], [['flavor'], flavor], [['price_cents'], priceCents],
+      [['price'], roundMoney(priceCents / 100)], [['active'], active ? 1 : 0],
+      [['pos_variant_id'], posId], [['created_at'], nowIso()], [['updated_at'], nowIso()]
+    ]);
+    await audit(env, tenantId, 'menu_item_created', { menu_item_id: id, sku });
+    return { ok: true, created: true, item_id: id };
+  }
+  const set = ['sku = ?', 'name = ?', 'category = ?', 'size = ?', 'flavor = ?', 'price_cents = ?', 'price = ?', 'active = ?', 'updated_at = ?'];
+  const params = [sku, name, category, size, flavor, priceCents, roundMoney(priceCents / 100), active ? 1 : 0, nowIso()];
+  if (body.pos_variant_id !== undefined) { set.push('pos_variant_id = ?'); params.push(posId); }
+  params.push(tenantId, existing.id);
+  await env.DB.prepare('UPDATE menu_items SET ' + set.join(', ') + ' WHERE tenant_id = ? AND id = ?').bind(...params).run();
+  await audit(env, tenantId, 'menu_item_updated', { menu_item_id: existing.id, sku, active });
+  return { ok: true, updated: true, item_id: existing.id };
+}
+
+async function getManagerTables(env, tenantId) {
+  await ensureSchema(env);
+  const config = await getEffectiveBusinessConfig(env, tenantId);
+  const assignments = await env.DB.prepare(
+    "SELECT a.id, a.table_number, a.booking_id, a.status, a.assigned_by, a.created_at, b.booking_time, b.duration_minutes, b.party_size, b.customer_name, b.status AS booking_status FROM table_assignments a LEFT JOIN bookings b ON b.tenant_id = a.tenant_id AND b.id = a.booking_id WHERE a.tenant_id = ? AND a.status IN ('reserved', 'occupied') ORDER BY a.table_number, a.created_at DESC"
+  ).bind(tenantId).all();
+  const tables = [];
+  for (let number = 1; number <= config.maxTables; number++) {
+    const current = (assignments.results || []).find(row => Number(row.table_number) === number) || null;
+    tables.push({
+      table_number: number, seats: 4, status: current ? current.status : 'available',
+      booking: current ? {
+        booking_id: current.booking_id, booking_time: current.booking_time,
+        duration_minutes: Number(current.duration_minutes) || 90,
+        party_size: Number(current.party_size) || 1,
+        customer_name: current.customer_name || 'Guest',
+        booking_status: current.booking_status
+      } : null
+    });
+  }
+  const bookings = await env.DB.prepare(
+    'SELECT id, booking_time, duration_minutes, party_size, customer_name, status, created_at FROM bookings WHERE tenant_id = ? AND booking_time >= ? ORDER BY booking_time LIMIT 300'
+  ).bind(tenantId, new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString()).all();
+  const assignedIds = new Set((assignments.results || []).map(row => String(row.booking_id)));
+  return {
+    ok: true, tenant_id: tenantId, max_tables: config.maxTables, seats_per_table: 4,
+    tables, bookings: bookings.results || [],
+    unassigned_bookings: (bookings.results || []).filter(row => !assignedIds.has(String(row.id)))
+  };
+}
+
+async function assignManagerTables(env, tenantId, body) {
+  await ensureSchema(env);
+  const bookingId = clean(body.booking_id || '', 100);
+  const rawNumbers = Array.isArray(body.table_numbers) ? body.table_numbers : [];
+  const tableNumbers = Array.from(new Set(rawNumbers.map(Number)));
+  const status = clean(body.status || 'reserved', 20);
+  const config = await getEffectiveBusinessConfig(env, tenantId);
+  if (!bookingId || !tableNumbers.length || tableNumbers.some(n => !Number.isInteger(n) || n < 1 || n > config.maxTables)) {
+    throw new AppError('booking_id and valid table_numbers are required.', 'invalid_table_assignment', 400);
+  }
+  if (!['reserved', 'occupied'].includes(status)) throw new AppError('status must be reserved or occupied.', 'invalid_table_status', 400);
+  const booking = await env.DB.prepare(
+    'SELECT id, booking_time, duration_minutes, party_size, status FROM bookings WHERE tenant_id = ? AND id = ? LIMIT 1'
+  ).bind(tenantId, bookingId).first();
+  if (!booking) throw new AppError('Booking not found for this tenant.', 'booking_not_found', 404);
+  if (['cancelled', 'canceled', 'rejected', 'no_show'].includes(norm(booking.status))) {
+    throw new AppError('A cancelled or rejected booking cannot be assigned a table.', 'booking_not_assignable', 409);
+  }
+  const partySize = Math.max(1, Number(booking.party_size) || 1);
+  const requiredTables = Math.ceil(partySize / 4);
+  if (tableNumbers.length < requiredTables) throw new AppError('This reservation needs at least ' + requiredTables + ' physical table(s).', 'insufficient_table_assignment', 409);
+  const bookingStart = new Date(booking.booking_time).getTime();
+  const bookingEnd = bookingStart + (Number(booking.duration_minutes) || 90) * 60000;
+  if (!Number.isFinite(bookingStart)) throw new AppError('Booking time is invalid.', 'booking_time_invalid', 409);
+  const placeholders = tableNumbers.map(() => '?').join(',');
+  const existing = await env.DB.prepare(
+    "SELECT a.table_number, a.booking_id, b.booking_time, b.duration_minutes FROM table_assignments a JOIN bookings b ON b.tenant_id = a.tenant_id AND b.id = a.booking_id WHERE a.tenant_id = ? AND a.status IN ('reserved','occupied') AND a.table_number IN (" + placeholders + ") AND a.booking_id != ?"
+  ).bind(tenantId, ...tableNumbers, bookingId).all();
+  const conflicts = (existing.results || []).filter(row => {
+    const start = new Date(row.booking_time).getTime();
+    const end = start + (Number(row.duration_minutes) || 90) * 60000;
+    return bookingStart < end && bookingEnd > start;
+  });
+  if (conflicts.length) throw new AppError('One or more selected tables are already assigned to an overlapping reservation.', 'table_assignment_conflict', 409, {
+    conflicts: conflicts.map(row => ({ table_number: row.table_number, booking_id: row.booking_id }))
+  });
+  const statements = [
+    env.DB.prepare("UPDATE table_assignments SET status = 'cleared', cleared_at = ?, updated_at = ? WHERE tenant_id = ? AND booking_id = ? AND status IN ('reserved','occupied')")
+      .bind(nowIso(), nowIso(), tenantId, bookingId),
+    ...tableNumbers.map(number => env.DB.prepare(
+      'INSERT INTO table_assignments (tenant_id,id,table_number,booking_id,status,assigned_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)'
+    ).bind(tenantId, 'TAB-' + makeId(10), number, bookingId, status, 'manager_dashboard', nowIso(), nowIso()))
+  ];
+  await env.DB.batch(statements);
+  await audit(env, tenantId, 'physical_tables_assigned', { booking_id: bookingId, table_numbers: tableNumbers, status });
+  return { ok: true, booking_id: bookingId, table_numbers: tableNumbers, status };
+}
+
+async function handleManagerApi(request, env, url, path) {
+  await requireManagerDashboardAuth(request, env);
+  const tenantId = DEFAULT_TENANT;
+  const method = request.method.toUpperCase();
+  if (method === 'GET') {
+    if (path === '/manager/menu') return json(request, env, { ok: true, tenant_id: tenantId, items: await getManagerMenu(env, tenantId) });
+    if (path === '/manager/tasks') {
+      await ensureSchema(env);
+      const result = await env.DB.prepare('SELECT id, task_id, title, description, priority, status, created_at FROM manager_tasks WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 500').bind(tenantId).all();
+      return json(request, env, { ok: true, tenant_id: tenantId, tasks: result.results || [] });
+    }
+    if (path === '/manager/notifications') {
+      await ensureSchema(env);
+      const result = await env.DB.prepare('SELECT id, notification_id, message, notification_type, channel, status, read_at, created_at FROM notifications WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 500').bind(tenantId).all();
+      return json(request, env, { ok: true, tenant_id: tenantId, notifications: result.results || [] });
+    }
+    if (path === '/manager/ai-activity') {
+      await ensureSchema(env);
+      const result = await env.DB.prepare('SELECT id, call_id, tool_name, state, duration_ms, details, created_at FROM ai_activity WHERE tenant_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 500')
+        .bind(tenantId, new Date(Date.now() - RETENTION_DAYS * 86400000).toISOString()).all();
+      return json(request, env, { ok: true, tenant_id: tenantId, steps: result.results || [] });
+    }
+    if (path === '/manager/tables') return json(request, env, await getManagerTables(env, tenantId));
+    if (path === '/manager/settings') {
+      const config = await getEffectiveBusinessConfig(env, tenantId);
+      return json(request, env, { ok: true, tenant_id: tenantId, settings: {
+        open_hour: config.openHour, close_hour: config.closeHour, cutoff_minutes: config.cutoffMinutes,
+        max_tables: config.maxTables, min_minutes: config.minMinutes, max_minutes: config.maxMinutes,
+        default_minutes: config.defaultMinutes, time_zone: config.timeZone, hours: businessHoursMessage(config)
+      }});
+    }
+    if (path === '/manager/calls') {
+      await ensureSchema(env);
+      const result = await env.DB.prepare(
+        "SELECT call_id, customer_phone, purpose, direction, status, started_at, control_url, listen_url FROM calls WHERE tenant_id = ? AND LOWER(COALESCE(status,'')) IN ('in_progress','in-progress','ringing','active') ORDER BY started_at DESC LIMIT 50"
+      ).bind(tenantId).all();
+      return json(request, env, { ok: true, tenant_id: tenantId, calls: (result.results || []).map(row => ({
+        call_id: row.call_id, customer_phone: row.customer_phone, purpose: row.purpose, direction: row.direction,
+        status: row.status, started_at: row.started_at, listen_available: Boolean(row.listen_url),
+        transfer_available: Boolean(row.control_url)
+      }))});
+    }
+    if (path === '/manager/calls/listen') {
+      const callId = clean(url.searchParams.get('call_id') || '', 120);
+      if (!callId) throw new AppError('call_id is required.', 'call_id_required', 400);
+      const row = await env.DB.prepare('SELECT status, listen_url FROM calls WHERE tenant_id = ? AND call_id = ? LIMIT 1').bind(tenantId, callId).first();
+      if (!row) throw new AppError('Call not found.', 'call_not_found', 404);
+      if (!['in_progress','in-progress','ringing','active'].includes(norm(row.status))) throw new AppError('Only active calls can be listened to.', 'call_not_active', 409);
+      if (!row.listen_url) throw new AppError('Vapi did not provide a listen URL. Check assistant monitorPlan.listenEnabled.', 'call_listen_unavailable', 503);
+      return json(request, env, { ok: true, call_id: callId, listen_url: row.listen_url, transport: 'websocket' });
+    }
+    return json(request, env, { ok: false, error: 'Manager route not found.', code: 'manager_route_not_found' }, 404);
+  }
+
+  const body = await readJson(request, env);
+  if (method === 'POST' && path === '/manager/menu') return json(request, env, await saveManagerMenuItem(env, tenantId, body, true), 201);
+  if (method === 'PATCH' && path === '/manager/menu') return json(request, env, await saveManagerMenuItem(env, tenantId, body, false));
+  if (method === 'PATCH' && path === '/manager/tasks') {
+    const taskId = clean(body.task_id || body.id || '', 100);
+    const status = norm(body.status || '');
+    if (!taskId || !['open','in_progress','acknowledged','resolved','dismissed'].includes(status)) throw new AppError('task_id and a supported status are required.', 'invalid_manager_task_update', 400);
+    const result = await env.DB.prepare('UPDATE manager_tasks SET status = ? WHERE tenant_id = ? AND (id = ? OR task_id = ?)')
+      .bind(status, tenantId, taskId, taskId).run();
+    if (Number(result.meta?.changes || 0) !== 1) throw new AppError('Manager task not found.', 'manager_task_not_found', 404);
+    await audit(env, tenantId, 'manager_task_status_updated', { task_id: taskId, status });
+    return json(request, env, { ok: true, task_id: taskId, status });
+  }
+  if (method === 'POST' && path === '/manager/notifications/read') {
+    const ids = Array.isArray(body.ids) ? body.ids.map(v => clean(v, 100)).filter(Boolean).slice(0, 500) : [];
+    const now = nowIso();
+    let result;
+    if (body.all === true) {
+      result = await env.DB.prepare('UPDATE notifications SET read_at = ? WHERE tenant_id = ? AND read_at IS NULL').bind(now, tenantId).run();
+    } else if (ids.length) {
+      const placeholders = ids.map(() => '?').join(',');
+      result = await env.DB.prepare(
+        'UPDATE notifications SET read_at = ? WHERE tenant_id = ? AND read_at IS NULL AND (id IN (' + placeholders + ') OR notification_id IN (' + placeholders + '))'
+      ).bind(now, tenantId, ...ids, ...ids).run();
+    } else throw new AppError('Supply ids or set all=true.', 'notification_ids_required', 400);
+    const updated = Number(result.meta?.changes || 0);
+    await audit(env, tenantId, 'notifications_marked_read', { updated_count: updated, all: body.all === true });
+    return json(request, env, { ok: true, updated_count: updated, read_at: now });
+  }
+  if (method === 'PATCH' && path === '/manager/settings') {
+    const config = await getEffectiveBusinessConfig(env, tenantId);
+    const mapping = {
+      open_hour: ['openHour', 0, 23], close_hour: ['closeHour', 0, 23],
+      cutoff_minutes: ['cutoffMinutes', 0, 180], max_tables: ['maxTables', 1, 10],
+      min_minutes: ['minMinutes', 15, 240], max_minutes: ['maxMinutes', 30, 480],
+      default_minutes: ['defaultMinutes', 30, 240]
+    };
+    for (const [key, spec] of Object.entries(mapping)) {
+      if (body[key] === undefined) continue;
+      const value = Number(body[key]);
+      if (!Number.isInteger(value) || value < spec[1] || value > spec[2]) throw new AppError(key + ' must be an integer between ' + spec[1] + ' and ' + spec[2] + '.', 'invalid_business_setting', 400);
+      config[spec[0]] = value;
+    }
+    if (config.openHour === config.closeHour || config.minMinutes > config.maxMinutes || config.defaultMinutes < config.minMinutes || config.defaultMinutes > config.maxMinutes) {
+      throw new AppError('Opening/closing hours or booking duration settings are inconsistent.', 'business_settings_inconsistent', 400);
+    }
+    const updated = await managerSettingsWrite(env, tenantId, config);
+    return json(request, env, { ok: true, settings: {
+      open_hour: updated.openHour, close_hour: updated.closeHour, cutoff_minutes: updated.cutoffMinutes,
+      max_tables: updated.maxTables, min_minutes: updated.minMinutes, max_minutes: updated.maxMinutes,
+      default_minutes: updated.defaultMinutes, time_zone: updated.timeZone, hours: businessHoursMessage(updated)
+    }});
+  }
+  if (method === 'POST' && path === '/manager/tables/assign') return json(request, env, await assignManagerTables(env, tenantId, body));
+  if (method === 'POST' && path === '/manager/tables/status') {
+    const bookingId = clean(body.booking_id || '', 100);
+    const status = clean(body.status || '', 20);
+    if (!bookingId || !['reserved','occupied','cleared'].includes(status)) throw new AppError('booking_id and a valid status are required.', 'invalid_table_status', 400);
+    const result = await env.DB.prepare("UPDATE table_assignments SET status = ?, updated_at = ?, cleared_at = ? WHERE tenant_id = ? AND booking_id = ? AND status IN ('reserved','occupied')")
+      .bind(status, nowIso(), status === 'cleared' ? nowIso() : null, tenantId, bookingId).run();
+    if (Number(result.meta?.changes || 0) === 0) throw new AppError('No active table assignment found for this booking.', 'table_assignment_not_found', 404);
+    await audit(env, tenantId, 'physical_table_status_changed', { booking_id: bookingId, status });
+    return json(request, env, { ok: true, booking_id: bookingId, status, updated_count: Number(result.meta?.changes || 0) });
+  }
+  if (method === 'POST' && path === '/manager/orders/action') {
+    const orderReference = clean(body.order_reference || body.order_id || '', 100);
+    const action = norm(body.action || '');
+    if (!orderReference || !['cancel','change'].includes(action)) throw new AppError('order_reference and action (cancel/change) are required.', 'invalid_order_action', 400);
+    const order = await env.DB.prepare('SELECT order_id, id, customer_phone, created_at, status FROM orders WHERE tenant_id = ? AND (order_id = ? OR id = ?) LIMIT 1')
+      .bind(tenantId, orderReference, orderReference).first();
+    if (!order) throw new AppError('Order not found.', 'order_not_found', 404);
+    if (!order.customer_phone) throw new AppError('Stored customer phone is unavailable; order verification cannot be completed.', 'order_customer_verification_unavailable', 409);
+    let result;
+    if (action === 'cancel') {
+      result = await requestOrderCancellation(env, tenantId, {
+        order_reference: order.order_id || order.id, customer_phone: order.customer_phone,
+        reason: clean(body.reason || 'Manager dashboard cancellation request', 1000)
+      });
+    } else {
+      if (body.customer_confirmed !== true) throw new AppError('Record customer approval before applying an order change.', 'customer_confirmation_required', 409);
+      result = await requestOrderChange(env, tenantId, {
+        order_reference: order.order_id || order.id, customer_phone: order.customer_phone,
+        requested_changes: clean(body.requested_changes || 'Manager dashboard order amendment', 2000),
+        items: body.items, customer_confirmed: true, customer_decision: body.customer_decision
+      });
+    }
+    await audit(env, tenantId, 'manager_dashboard_order_action', { order_reference: order.order_id || order.id, action, result_status: clean(result?.status || '', 80) });
+    return json(request, env, { ok: true, order_reference: order.order_id || order.id, action, result });
+  }
+  if (method === 'POST' && path === '/manager/calls/transfer') {
+    const callId = clean(body.call_id || '', 120);
+    const reason = clean(body.reason || 'Manager takeover requested from dashboard', 500);
+    if (!callId) throw new AppError('call_id is required.', 'call_id_required', 400);
+    const call = await env.DB.prepare('SELECT status, control_url FROM calls WHERE tenant_id = ? AND call_id = ? LIMIT 1').bind(tenantId, callId).first();
+    if (!call) throw new AppError('Call not found.', 'call_not_found', 404);
+    if (!['in_progress','in-progress','ringing','active'].includes(norm(call.status))) throw new AppError('Only an active call can be transferred.', 'call_not_active', 409);
+    if (!call.control_url) throw new AppError('Vapi did not provide a control URL for this call.', 'call_control_unavailable', 503);
+    const result = await transferToManager(env, tenantId, { reason }, { controlUrl: call.control_url, callId });
+    await audit(env, tenantId, 'manager_dashboard_call_transfer_requested', { call_id: callId, live_transfer_started: Boolean(result.live_transfer_started) });
+    return json(request, env, { ok: true, call_id: callId, result });
+  }
+  return json(request, env, { ok: false, error: 'Manager route not found.', code: 'manager_route_not_found' }, 404);
+}
+
 async function handleFetch(request, env, ctx) {
   if (request.method === 'OPTIONS') return preflight(request, env);
   const url = new URL(request.url);
