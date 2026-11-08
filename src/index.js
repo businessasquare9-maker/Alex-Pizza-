@@ -596,7 +596,7 @@ async function ensureSchema(env) {
     // the 60-day detail window. Older archived totals can only be reconstructed to whole minutes.
     try {
       const legacyUsage = await env.DB.prepare(
-        'SELECT `month`, `total_minutes` FROM `monthly_call_usage` WHERE `total_seconds` = 0 AND `total_minutes` > 0'
+        'SELECT `tenant_id`, `month`, `total_minutes` FROM `monthly_call_usage` WHERE `total_seconds` = 0 AND `total_minutes` > 0'
       ).all();
       if ((legacyUsage.results || []).length) {
         const callRows = await env.DB.prepare(
