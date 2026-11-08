@@ -2435,7 +2435,8 @@ async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, re
     const orderInsert = await prepareScopedInsert(env, 'orders', tenantId, [
       [['id'], orderId], [['order_id'], orderId],
       [['customer_name', 'name'], customerName],
-      [['customer_phone', 'phone'], envFlag(env, ENV_KEYS.storeRawPhone, true) ? customerPhone : null],
+      // Persist the verified customer contact on the order so receipts and POS-failure updates reach the caller.
+      [['customer_phone', 'phone'], customerPhone],
       [['caller_hash'], callerRef], [['order_type', 'fulfillment_type'], orderType],
       [['delivery_address'], clean(args.delivery_address || '', 300) || null],
       [['related_order_id'], clean(args.__related_order_id || '', 100) || null],
