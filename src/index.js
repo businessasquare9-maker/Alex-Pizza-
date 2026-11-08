@@ -40,7 +40,7 @@ const ALLOWED_TABLES = new Set([
   'tenants', 'audit_log', 'bookings', 'business_settings', 'calls',
   'integration_status', 'manager_tasks', 'manager_status_checks', 'call_usage_ticks', 'menu_items', 'notifications',
   'order_change_requests', 'order_items', 'orders', 'zoho_oauth_tokens',
-  'monthly_call_usage', 'manual_payments', 'invoices'
+  'monthly_call_usage', 'manual_payments', 'invoices', 'ai_activity', 'table_assignments'
 ]);
 
 const TENANT_COLUMNS = [
@@ -103,7 +103,7 @@ const GENERIC_HINT = /^(phone|phone_number|contact_number|whatsapp_number|hotlin
 
 const PURGE_TABLES = [
   'audit_log', 'bookings', 'calls', 'call_usage_ticks', 'notifications', 'manager_tasks', 'manager_status_checks',
-  'order_change_requests', 'order_items', 'orders'
+  'order_change_requests', 'order_items', 'orders', 'ai_activity', 'table_assignments'
 ];
 
 const DQ = String.fromCharCode(34);
@@ -527,14 +527,16 @@ const SCHEMA_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS `integration_status` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `provider` TEXT, `status` TEXT, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `menu_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `sku` TEXT, `name` TEXT NOT NULL, `category` TEXT, `size` TEXT, `flavor` TEXT, `price_cents` INTEGER NOT NULL DEFAULT 0, `price` REAL, `active` INTEGER NOT NULL DEFAULT 1, `pos_variant_id` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `bookings` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `booking_time` TEXT NOT NULL, `duration_minutes` INTEGER NOT NULL DEFAULT 90, `party_size` INTEGER, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `status` TEXT, `notes` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `status` TEXT, `started_at` TEXT, `duration_seconds` INTEGER, `billable_minutes` INTEGER NOT NULL DEFAULT 0, `ended_at` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `calls` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `purpose` TEXT, `direction` TEXT, `status` TEXT, `started_at` TEXT, `duration_seconds` INTEGER, `billable_minutes` INTEGER NOT NULL DEFAULT 0, `ended_at` TEXT, `control_url` TEXT, `listen_url` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_tasks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `task_id` TEXT, `title` TEXT, `description` TEXT, `priority` TEXT, `status` TEXT, `caller_hash` TEXT, `dedupe_key` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `manager_status_checks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_reference` TEXT NOT NULL, `customer_phone` TEXT, `caller_hash` TEXT, `manager_phone` TEXT, `inbound_call_id` TEXT, `inbound_control_url` TEXT, `outbound_call_id` TEXT, `status` TEXT, `manager_response` TEXT, `callback_status` TEXT, `callback_sent_at` TEXT, `started_at` TEXT, `completed_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `call_usage_ticks` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT NOT NULL, `minute_index` INTEGER NOT NULL, `month` TEXT NOT NULL, `counted_at` TEXT NOT NULL, `created_at` TEXT NOT NULL, PRIMARY KEY (`tenant_id`, `id`))',
-  'CREATE TABLE IF NOT EXISTS `notifications` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `notification_id` TEXT, `recipient_phone` TEXT, `sender_phone` TEXT, `message` TEXT, `notification_type` TEXT, `channel` TEXT, `status` TEXT, `provider_message_id` TEXT, `metadata` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `notifications` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `notification_id` TEXT, `recipient_phone` TEXT, `sender_phone` TEXT, `message` TEXT, `notification_type` TEXT, `channel` TEXT, `status` TEXT, `provider_message_id` TEXT, `metadata` TEXT, `read_at` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `orders` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `customer_name` TEXT, `customer_phone` TEXT, `caller_hash` TEXT, `order_type` TEXT, `total` REAL NOT NULL DEFAULT 0, `currency` TEXT, `items_json` TEXT, `status` TEXT, `notes` TEXT, `pos_salesorder_id` TEXT, `pos_confirmed_at` TEXT, `pos_sync_lock_owner` TEXT, `pos_sync_lock_expires_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `order_items` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `sku` TEXT, `name` TEXT, `category` TEXT, `unit_price` REAL NOT NULL DEFAULT 0, `quantity` INTEGER NOT NULL DEFAULT 1, `line_total` REAL NOT NULL DEFAULT 0, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `order_change_requests` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `order_id` TEXT, `caller_hash` TEXT, `requested_change` TEXT, `reason` TEXT, `status` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `ai_activity` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `call_id` TEXT, `tool_name` TEXT, `state` TEXT, `duration_ms` INTEGER, `details` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
+  'CREATE TABLE IF NOT EXISTS `table_assignments` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `table_number` INTEGER NOT NULL, `booking_id` TEXT NOT NULL, `status` TEXT NOT NULL, `assigned_by` TEXT, `created_at` TEXT, `updated_at` TEXT, `cleared_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `monthly_call_usage` (`tenant_id` TEXT NOT NULL, `month` TEXT NOT NULL, `total_minutes` INTEGER NOT NULL DEFAULT 0, `last_call_at` TEXT, `status` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `month`))',
   'CREATE TABLE IF NOT EXISTS `manual_payments` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `payment_id` TEXT, `amount` REAL NOT NULL, `currency` TEXT NOT NULL DEFAULT \'USD\', `method` TEXT, `reference` TEXT, `notes` TEXT, `recorded_by` TEXT, `created_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
   'CREATE TABLE IF NOT EXISTS `invoices` (`tenant_id` TEXT NOT NULL, `id` TEXT NOT NULL, `invoice_id` TEXT, `billing_month` TEXT, `minutes` INTEGER, `amount_due` REAL, `amount_paid` REAL DEFAULT 0, `status` TEXT, `due_at` TEXT, `created_at` TEXT, `updated_at` TEXT, PRIMARY KEY (`tenant_id`, `id`))',
@@ -588,7 +590,10 @@ async function ensureSchema(env) {
       'ALTER TABLE `calls` ADD COLUMN `billable_minutes` INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE `calls` ADD COLUMN `ended_at` TEXT',
       'ALTER TABLE `calls` ADD COLUMN `started_at` TEXT',
-      'ALTER TABLE `calls` ADD COLUMN `status` TEXT'
+      'ALTER TABLE `calls` ADD COLUMN `status` TEXT',
+      'ALTER TABLE `calls` ADD COLUMN `control_url` TEXT',
+      'ALTER TABLE `calls` ADD COLUMN `listen_url` TEXT',
+      'ALTER TABLE `notifications` ADD COLUMN `read_at` TEXT'
     ]) { try { await env.DB.prepare(migration).run(); } catch {} }
     // Preserve legacy dollar-denominated menu prices when adding the cents column.
     try {
@@ -600,6 +605,8 @@ async function ensureSchema(env) {
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_call_usage_tick` ON `call_usage_ticks` (`tenant_id`, `call_id`, `minute_index`)').run(); } catch {}
     try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS `idx_manager_status_order` ON `manager_status_checks` (`tenant_id`, `order_reference`, `created_at`)').run(); } catch {}
     try { await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS `idx_manager_status_outbound_call` ON `manager_status_checks` (`tenant_id`, `outbound_call_id`)').run(); } catch {}
+    try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS `idx_ai_activity_tenant_time` ON `ai_activity` (`tenant_id`, `created_at`)').run(); } catch {}
+    try { await env.DB.prepare('CREATE INDEX IF NOT EXISTS `idx_table_assignments_tenant_booking` ON `table_assignments` (`tenant_id`, `booking_id`, `status`)').run(); } catch {}
     columnCache.clear();
     return { tablesChecked };
   })();
@@ -802,6 +809,26 @@ function businessConfig(env) {
     defaultMinutes: envNumber(env, ['DEFAULT_BOOKING_MINUTES'], SLOT_DEFAULT_MINUTES, 30, 240)
   };
 }
+async function getEffectiveBusinessConfig(env, tenantId) {
+  const config = businessConfig(env);
+  await ensureSchema(env);
+  const result = await env.DB.prepare('SELECT `setting_key`, `setting_value` FROM `business_settings` WHERE `tenant_id` = ?').bind(tenantId).all();
+  const allowed = {
+    open_hour: ['openHour', 0, 23], close_hour: ['closeHour', 0, 23],
+    cutoff_minutes: ['cutoffMinutes', 0, 180], max_tables: ['maxTables', 1, 10],
+    min_minutes: ['minMinutes', 15, 240], max_minutes: ['maxMinutes', 30, 480], default_minutes: ['defaultMinutes', 30, 240]
+  };
+  for (const row of result.results || []) {
+    const spec = allowed[norm(row.setting_key)];
+    if (!spec) continue;
+    const value = Number(row.setting_value);
+    if (Number.isInteger(value) && value >= spec[1] && value <= spec[2]) config[spec[0]] = value;
+  }
+  if (config.minMinutes > config.maxMinutes) throw new AppError('Saved booking duration settings are inconsistent.', 'business_settings_invalid', 500);
+  config.defaultMinutes = Math.max(config.minMinutes, Math.min(config.maxMinutes, config.defaultMinutes));
+  return config;
+}
+
 function formatHour(hour) {
   const h = Number(hour) % 24;
   const suffix = h < 12 ? 'AM' : 'PM';
@@ -1038,7 +1065,7 @@ async function updateBookingStatus(env, tenantId, bookingId, status) {
 
 async function checkAvailability(env, tenantId, bookingTime, durationMinutes, requestedPartySize = 1) {
   await ensureSchema(env);
-  const config = businessConfig(env);
+  const config = await getEffectiveBusinessConfig(env, tenantId);
   const start = parseBookingTime(bookingTime, config.timeZone).getTime();
   if (start < Date.now() - 5 * 60000) {
     return { available: false, reason: 'Booking time cannot be in the past.' };
@@ -1183,6 +1210,7 @@ async function insertBookingWithinCapacity(env, tenantId, booking) {
 }
 
 async function createBooking(env, tenantId, args) {
+  const effectiveConfig = await getEffectiveBusinessConfig(env, tenantId);
   const availability = await checkAvailability(env, tenantId, args.booking_time, args.duration_minutes, args.party_size || args.guests || 1);
   if (!availability.available) {
     return { ok: false, code: 'booking_unavailable', ...availability };
@@ -1205,7 +1233,7 @@ async function createBooking(env, tenantId, args) {
     status: bookingStatusInitial,
     notes: clean(args.notes || '', 1000),
     createdAt: bookingCreatedAt,
-    maxTables: businessConfig(env).maxTables,
+    maxTables: effectiveConfig.maxTables,
     externalCalendarSeats: availability.external_calendar_seats,
     externalCalendarTables: availability.external_calendar_tables
   });
@@ -2409,10 +2437,11 @@ async function createOrderRecord(env, tenantId, args, pricedItems, callerRef, re
 
 async function submitOrder(env, tenantId, args, ctx) {
   await ensureSchema(env);
-  const orderHours = isWithinBusinessHours(new Date(), businessConfig(env));
+  const effectiveConfig = await getEffectiveBusinessConfig(env, tenantId);
+  const orderHours = isWithinBusinessHours(new Date(), effectiveConfig);
   if (!orderHours.ok) {
     throw new AppError('Alex Pizza is not accepting new orders at this time. ' + orderHours.reason,
-      'ordering_closed', 409, { time_zone: businessConfig(env).timeZone, cutoff_minutes: businessConfig(env).cutoffMinutes });
+      'ordering_closed', 409, { time_zone: effectiveConfig.timeZone, cutoff_minutes: effectiveConfig.cutoffMinutes });
   }
   // A missing/failed Workflow must never discard a customer-confirmed order; persist and dispatch it first.
   if (args.customer_confirmed !== true) throw new AppError('Customer confirmation is required before submitting an order.', 'customer_confirmation_required', 400);
@@ -2762,8 +2791,8 @@ async function requestOrderChange(env, tenantId, args) {
     message_for_assistant: 'The complete revised order was saved atomically within the first 5 minutes. The manager and customer receipt dispatch were initiated. Do not claim the POS or kitchen copy was changed automatically.' };
 }
 
-function getBusinessInfo(env) {
-  const config = businessConfig(env);
+async function getBusinessInfo(env, tenantId) {
+  const config = await getEffectiveBusinessConfig(env, tenantId);
   return {
     ok: true,
     name: 'Alex Pizza NYC',
@@ -2938,6 +2967,17 @@ async function requestOrderCancellation(env, tenantId, args) {
   };
 }
 
+function validatedMonitorUrl(raw, kind) {
+  if (!raw) return '';
+  try {
+    const url = new URL(String(raw));
+    const protocol = kind === 'listen' ? 'wss:' : 'https:';
+    const suffix = kind === 'listen' ? '/listen' : '/control';
+    if (url.protocol !== protocol || !url.hostname.toLowerCase().endsWith('.vapi.ai') || !url.pathname.endsWith(suffix)) return '';
+    return url.toString();
+  } catch { return ''; }
+}
+
 async function recordInboundCallStart(env, tenantId, call) {
   await ensureSchema(env);
   const callId = clean(call?.id || '', 120);
@@ -2946,6 +2986,12 @@ async function recordInboundCallStart(env, tenantId, call) {
     'SELECT `status`, `direction` FROM `calls` WHERE `tenant_id` = ? AND `call_id` = ? LIMIT 1'
   ).bind(tenantId, callId).first();
   if (existing) {
+    const controlUrl = validatedMonitorUrl(call?.monitor?.controlUrl, 'control');
+    const listenUrl = validatedMonitorUrl(call?.monitor?.listenUrl, 'listen');
+    if (controlUrl || listenUrl) {
+      await env.DB.prepare('UPDATE `calls` SET `control_url` = COALESCE(?, `control_url`), `listen_url` = COALESCE(?, `listen_url`) WHERE `tenant_id` = ? AND `call_id` = ?')
+        .bind(controlUrl || null, listenUrl || null, tenantId, callId).run();
+    }
     // Repeated Vapi in-progress webhook can safely recover a missed Workflow start.
     if (norm(existing.status) === 'in_progress' && env.CALL_USAGE_WORKFLOW && typeof env.CALL_USAGE_WORKFLOW.create === 'function') {
       try {
@@ -2987,6 +3033,8 @@ async function recordInboundCallStart(env, tenantId, call) {
     [['caller_hash'], callerRef],
     [['purpose'], direction === 'outbound' ? 'Vapi outbound manager status call' : 'Inbound Vapi call'],
     [['direction'], direction], [['status'], 'in_progress'], [['started_at'], startedAt],
+    [['control_url'], validatedMonitorUrl(call?.monitor?.controlUrl, 'control')],
+    [['listen_url'], validatedMonitorUrl(call?.monitor?.listenUrl, 'listen')],
     [['billable_minutes'], 0], [['created_at'], startedAt]
   ]);
 
@@ -3335,8 +3383,8 @@ const TOOL_HANDLERS = {
   async request_order_change(env, tenantId, args) {
     return await requestOrderChange(env, tenantId, args);
   },
-  async get_business_info(env) {
-    return getBusinessInfo(env);
+  async get_business_info(env, tenantId) {
+    return await getBusinessInfo(env, tenantId);
   },
   async flag_repeat_caller(env, tenantId, args) {
     const phone = customerPhoneFrom(args, true);
@@ -3398,8 +3446,20 @@ function getToolArgs(call) {
     call?.function?.arguments ?? call?.arguments ?? call?.parameters ?? call?.tool?.arguments ?? {}
   );
 }
+async function recordAiActivity(env, tenantId, callId, toolName, state, durationMs, details = {}) {
+  try {
+    await insertScoped(env, 'ai_activity', tenantId, [
+      [['id'], 'AI-' + makeId(12)], [['call_id'], clean(callId, 120)], [['tool_name'], clean(toolName, 120)],
+      [['state'], clean(state, 30)], [['duration_ms'], Math.max(0, Math.floor(Number(durationMs) || 0))],
+      [['details'], JSON.stringify(sanitizeDetails(details)).slice(0, 1500)], [['created_at'], nowIso()]
+    ]);
+  } catch (err) { safeLog(err); }
+}
+
 async function executeToolCall(env, tenantId, call, index, ctx) {
   const callId = getToolCallId(call, index);
+  const startedAt = Date.now();
+  const displayName = getToolName(call) || 'unknown_tool';
   try {
     const toolName = getToolName(call);
     const key = resolveToolName(toolName);
@@ -3413,8 +3473,10 @@ async function executeToolCall(env, tenantId, call, index, ctx) {
     args.__tool_call_id = (call?.toolCallId || call?.id || call?.callId) ? callId : '';
     args.__call_id = clean(ctx?.callId || '', 120);
     const payload = await handler(env, tenantId, args, ctx);
+    await recordAiActivity(env, tenantId, clean(ctx?.callId || '', 120), toolName, 'completed', Date.now() - startedAt, { tool_call_id: callId });
     return toolResult(callId, payload);
   } catch (err) {
+    await recordAiActivity(env, tenantId, clean(ctx?.callId || '', 120), displayName, 'failed', Date.now() - startedAt, { tool_call_id: callId, error_code: clean(err?.code || 'tool_error', 80) });
     return toolResult(callId, publicError(err));
   }
 }
@@ -3600,16 +3662,27 @@ async function collectManagerData(env, tenantId) {
     const rows = result.results || [];
     data[table] = table === 'manager_status_checks'
       ? rows.map(({ inbound_control_url, ...safeRow }) => safeRow)
-      : rows;
+      : table === 'calls'
+        ? rows.map(({ control_url, listen_url, ...safeRow }) => ({ ...safeRow, monitor_available: Boolean(control_url || listen_url) }))
+        : rows;
     recordCount += data[table].length;
   }
   const usage = await env.DB.prepare('SELECT `month`, `total_minutes`, `last_call_at`, `status`, `updated_at` FROM `monthly_call_usage` WHERE `tenant_id` = ? ORDER BY `month` DESC LIMIT 24').bind(tenantId).all();
   const invoices = await env.DB.prepare('SELECT `invoice_id`, `billing_month`, `minutes`, `amount_due`, `amount_paid`, `status`, `due_at`, `created_at` FROM `invoices` WHERE `tenant_id` = ? ORDER BY `billing_month` DESC LIMIT 24').bind(tenantId).all();
   const payments = await env.DB.prepare('SELECT `payment_id`, `amount`, `currency`, `method`, `reference`, `created_at` FROM `manual_payments` WHERE `tenant_id` = ? ORDER BY `created_at` DESC LIMIT 50').bind(tenantId).all();
+  const menuColumns = await getColumns(env, 'menu_items');
+  const menuScopeColumn = findColumn(menuColumns, TENANT_COLUMNS);
+  const menuCreatedColumn = findColumn(menuColumns, ['created_at', 'createdAt']);
+  const menuRows = menuScopeColumn
+    ? await env.DB.prepare(`SELECT * FROM ${q('menu_items')} WHERE ${q(menuScopeColumn)} = ? ORDER BY ${menuCreatedColumn ? q(menuCreatedColumn) + ' DESC' : q('name')} LIMIT 200`).bind(tenantId).all()
+    : { results: [] };
+  data.menu_items = menuRows.results || [];
+  const currentBusinessSettings = await getEffectiveBusinessConfig(env, tenantId);
   const local = zonedParts(new Date(), TIME_ZONE_DEFAULT);
   const currentMonth = local.year + '-' + String(local.month).padStart(2, '0');
   const currentUsage = (usage.results || []).find(row => row.month === currentMonth) || { month: currentMonth, total_minutes: 0, status: 'active' };
-  return { ok: true, tenant_id: tenantId, retention_days: RETENTION_DAYS, retained_since: cutoff, exported_at: nowIso(), record_count: recordCount, data,
+  return { ok: true, tenant_id: tenantId, retention_days: RETENTION_DAYS, retained_since: cutoff, exported_at: nowIso(), record_count: recordCount + data.menu_items.length, data,
+    business_settings: currentBusinessSettings,
     billing: { current_month: currentUsage, monthly_history: usage.results || [], invoices: invoices.results || [], payments: payments.results || [] } };
 }
 
