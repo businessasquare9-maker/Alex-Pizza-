@@ -160,6 +160,19 @@ try {
   assert.match(source, /dashboard_token_hash/);
   assert.match(source, /\/admin\/provider-overview/);
   assert.match(source, /\/admin\/tenant-status/);
+  // Authenticated Alex Pizza client dashboard endpoints and new retained D1 records.
+  assert.match(source, /async function handleManagerApi/);
+  assert.match(source, /\/manager\/menu/);
+  assert.match(source, /\/manager\/tables\/assign/);
+  assert.match(source, /\/manager\/notifications\/read/);
+  assert.match(source, /\/manager\/orders\/action/);
+  assert.match(source, /\/manager\/calls\/transfer/);
+  assert.match(source, /\/manager\/calls\/listen/);
+  assert.match(source, /\/manager\/settings/);
+  assert.match(source, /\/manager\/ai-activity/);
+  assert.match(source, /CREATE TABLE IF NOT EXISTS `table_assignments`/);
+  assert.match(source, /CREATE TABLE IF NOT EXISTS `ai_activity`/);
+  assert.match(source, /read_at/);
 
   assert.match(source, /async function listZohoPosItems/);
   assert.match(source, /async function buildZohoMenuMappingReport/);
