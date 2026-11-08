@@ -266,7 +266,7 @@ function requirePhones(env, role) {
   return phones;
 }
 function customerPhoneFrom(args, required = false) {
-  const value = args?.customer_phone ?? args?.phone ?? args?.caller_phone ?? args?.from ?? args?.customerNumber;
+  const value = args?.__caller_phone || args?.customer_phone || args?.phone || args?.caller_phone || args?.from || args?.customerNumber;
   const normalized = normalizePhone(value);
   if (required && !normalized) {
     throw new AppError('A valid customer_phone is required in tool arguments.', 'customer_phone_required', 400);
@@ -3453,6 +3453,11 @@ async function executeToolCall(env, tenantId, call, index, ctx) {
     const args = getToolArgs(call);
     args.__tool_call_id = (call?.toolCallId || call?.id || call?.callId) ? callId : '';
     args.__call_id = clean(ctx?.callId || '', 120);
+    // For inbound calls, trust Vapi's verified caller context over model-supplied phone text.
+    // Outbound manager status calls must continue using their explicit customer reference.
+    if (ctx?.direction === 'inbound' && ctx?.customerPhone) {
+      args.__caller_phone = normalizePhone(ctx.customerPhone);
+    }
     const payload = await handler(env, tenantId, args, ctx);
     return toolResult(callId, payload);
   } catch (err) {
@@ -3496,7 +3501,9 @@ async function handleVapiTools(request, env, ctx, tenantId) {
     phoneNumberId: clean(vapiCall.phoneNumberId || vapiCall.phoneNumber?.id || '', 120),
     controlUrl: clean(vapiCall.monitor?.controlUrl || '', 1000),
     customerPhone: normalizePhone(vapiCall.customer?.number || vapiCall.customer?.phone || ''),
-    callType: clean(vapiCall.type || '', 40)
+    callType: clean(vapiCall.type || '', 40),
+    direction: norm(vapiCall.type || '').includes('outbound') ? 'outbound'
+      : norm(vapiCall.type || '').includes('inbound') ? 'inbound' : 'unknown'
   };
   const results = [];
   for (let i = 0; i < calls.length; i++) {
