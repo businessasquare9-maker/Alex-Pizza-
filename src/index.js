@@ -2170,6 +2170,34 @@ async function releaseOrderPosLock(env, tenantId, orderId, owner) {
   ).bind(nowIso(), tenantId, orderId, orderId, owner).run();
 }
 
+async function notifyCustomerPosIssue(env, tenantId, order, reason) {
+  const phone = normalizePhone(order?.customerPhone || order?.customer_phone || '');
+  if (!phone) return { queued: false, reason: 'customer_phone_unavailable' };
+  const reference = clean(order?.order_id || order?.id || '', 100);
+  const message = 'Alex Pizza order update. Your order ' + reference +
+    ' is confirmed and saved. Our POS system is taking longer than expected to synchronize it. ' +
+    'Your order is not cancelled. No action is needed from you; Alex Pizza will contact you if anything changes.';
+  try {
+    const result = await queueNotification(env, tenantId, {
+      to: phone,
+      from: resolvePhones(env, 'business')[0] || '',
+      message,
+      kind: 'customer_pos_sync_update',
+      channel: 'sms',
+      metadata: { order_id: reference, pos_sync_issue: clean(reason || 'zoho_pos_sync_pending', 120) }
+    });
+    await audit(env, tenantId, 'customer_pos_sync_update_queued', {
+      order_id: reference, notification_id: result.id || null, delivered: Boolean(result.delivered)
+    });
+    return { queued: true, ...result };
+  } catch (err) {
+    await recordIntegrationStatus(env, tenantId, 'customer_pos_notification', 'error', {
+      order_id: reference, code: clean(err?.code || 'customer_notification_failed', 80)
+    });
+    return { queued: false, reason: clean(err?.code || 'customer_notification_failed', 100) };
+  }
+}
+
 async function updateOrderStatus(env, tenantId, orderId, status) {
   const result = await env.DB.prepare(
     "UPDATE `orders` SET `status` = ?, `updated_at` = ? WHERE `tenant_id` = ? AND (`order_id` = ? OR `id` = ?) AND LOWER(COALESCE(`status`, '')) NOT IN ('cancelled', 'canceled')"
@@ -2239,6 +2267,7 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
               'Zoho POS sync failed after automatic retries for order ' + orderId + '. The customer-confirmed D1 order and receipt remain saved; manual POS reconciliation is required.',
               'zoho_pos_sync_error');
           } catch {}
+          await notifyCustomerPosIssue(this.env, tenantId, order, 'zoho_pos_sync_failed');
           return { status: 'pos_sync_failed' };
         });
         return { ok: false, order_id: orderId, status: 'pos_sync_failed' };
@@ -2269,11 +2298,13 @@ export class OrderProcessingWorkflow extends WorkflowEntrypoint {
       }
       await step.do('mark-pos-pending-under-pos-lock', async () => {
         await updateOrderStatus(this.env, tenantId, orderId, 'pending_pos_configuration');
+        const reason = clean(result?.reason || 'not_configured', 120);
         try {
           await queueRoleNotification(this.env, tenantId, 'manager',
-            'Order ' + orderId + ' is saved but not confirmed in Zoho POS. Reason: ' + clean(result?.reason || 'not_configured', 120),
+            'Order ' + orderId + ' is saved but not confirmed in Zoho POS. Reason: ' + reason,
             'zoho_pos_sync_error');
         } catch {}
+        await notifyCustomerPosIssue(this.env, tenantId, order, reason);
         return { status: 'pending_pos_configuration' };
       });
       return { ok: false, order_id: orderId, status: 'pending_pos_configuration', zoho: result };
