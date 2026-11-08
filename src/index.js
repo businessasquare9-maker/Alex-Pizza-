@@ -4391,6 +4391,10 @@ async function handleFetch(request, env, ctx) {
       return json(request, env, result);
     }
 
+    if (path.startsWith('/manager/') && path !== '/manager/data' && path !== '/manager/export') {
+      return await handleManagerApi(request, env, url, path);
+    }
+
     if (path.startsWith('/admin/')) return await handleAdmin(request, env, url, path);
 
     const vapiMatch = path.match(new RegExp('^/vapi/([a-z0-9-]+)/(tools|events)$', 'i'));
